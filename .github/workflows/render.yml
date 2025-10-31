@@ -4,89 +4,127 @@ on:
   repository_dispatch:
     types: [render_reel]
 
+permissions:
+  contents: write
+
 jobs:
   render:
     runs-on: ubuntu-latest
-    
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-      
-      - name: Download videos
+      - name: Set up FFmpeg
+        uses: FedericoCarboni/setup-ffmpeg@v2
+        with:
+          version: latest
+
+      - name: Install jq
         run: |
-          echo "Video URLs: ${{ toJSON(github.event.client_payload.video_urls) }}"
-          
-          # Parse JSON array and download each video
-          echo '${{ toJSON(github.event.client_payload.video_urls) }}' | jq -r '.[]' | while IFS= read -r url; do
-            index=$((index + 1))
-            echo "Downloading video $index from: $url"
-            curl -L -o "in_${index}.mp4" "$url" || echo "Failed to download $url"
-          done
-          
-          # List downloaded files
-          ls -lh in_*.mp4
-      
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      - name: Verify tools
+        run: |
+          ffmpeg -version | head -n1
+          jq --version
+
+      - name: Save payload
+        run: |
+          echo '${{ toJson(github.event.client_payload) }}' > payload.json
+          cat payload.json
+
+      - name: Extract params
+        id: params
+        run: |
+          set -euo pipefail
+          AUDIO_URL=$(jq -r '.audio_url' payload.json)
+          OUT_NAME=$(jq -r '.out_name // "reel.mp4"' payload.json)
+          WIDTH=$(jq -r '.width // 1080' payload.json)
+          HEIGHT=$(jq -r '.height // 1920' payload.json)
+          FPS=$(jq -r '.fps // 30' payload.json)
+          MAX_CLIPS=$(jq -r '.max_clips // 14' payload.json)
+          echo "AUDIO_URL=$AUDIO_URL" >> $GITHUB_ENV
+          echo "OUT_NAME=$OUT_NAME" >> $GITHUB_ENV
+          echo "WIDTH=$WIDTH" >> $GITHUB_ENV
+          echo "HEIGHT=$HEIGHT" >> $GITHUB_ENV
+          echo "FPS=$FPS" >> $GITHUB_ENV
+          echo "MAX_CLIPS=$MAX_CLIPS" >> $GITHUB_ENV
+
       - name: Download audio
         run: |
-          echo "Downloading audio from: ${{ github.event.client_payload.audio_url }}"
-          curl -L -o "audio.mp3" "${{ github.event.client_payload.audio_url }}"
-          ls -lh audio.mp3
-      
-      - name: Normalize videos to vertical format
+          set -euo pipefail
+          curl -L --fail --retry 3 "$AUDIO_URL" -o audio.mp3
+
+      - name: Get audio duration seconds
+        id: dur
         run: |
-          if ls in_*.mp4 1> /dev/null 2>&1; then
-            for f in in_*.mp4; do
-              out="norm_${f#in_}"
-              echo "Processing $f -> $out"
-              
-              # Scale and crop to 1080x1920 (9:16 aspect ratio)
-              ffmpeg -i "$f" \
-                -vf "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920" \
-                -an \
-                -c:v libx264 -preset fast -crf 23 \
-                -y "$out"
-            done
-          else
-            echo "No video files found!"
+          set -euo pipefail
+          D=$(ffprobe -v error -show_entries format=duration -of default=nokey=1:noprint_wrappers=1 audio.mp3 || echo 60)
+          D=${D%.*}
+          if [ -z "$D" ] || [ "$D" = "N/A" ]; then D=60; fi
+          echo "dur=$D" >> $GITHUB_OUTPUT
+
+      - name: Download up to MAX_CLIPS video clips from payload
+        run: |
+          set -euo pipefail
+          i=0
+          jq -r '.video_urls[]' payload.json | while read -r URL; do
+            i=$((i+1))
+            [ $i -le $MAX_CLIPS ] || break
+            curl -L --fail --retry 3 "$URL" -o "in_${i}.mp4"
+          done
+          ls -l in_*.mp4
+
+      - name: Normalize each clip to vertical and mute
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(in_*.mp4)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No input clips downloaded"
             exit 1
           fi
-          
-          # List processed files
-          ls -lh norm_*.mp4
-      
-      - name: Create concat list
-        run: |
-          for f in norm_*.mp4; do
-            echo "file '$f'" >> concat.txt
+          for f in "${files[@]}"; do
+            n=${f#in_}; n=${n%.mp4}
+            echo "Processing $f -> norm_${n}.mp4"
+            ffmpeg -y -i "$f" \
+              -vf "scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=cover,setsar=1,fps=${FPS}" \
+              -an -c:v libx264 -preset veryfast -crf 18 -pix_fmt yuv420p "norm_${n}.mp4"
           done
-          echo "Concat list:"
-          cat concat.txt
-      
-      - name: Concatenate videos
+
+      - name: Concat normalized clips
         run: |
-          ffmpeg -f concat -safe 0 -i concat.txt \
-            -c copy \
-            -y concatenated.mp4
-          
-          ls -lh concatenated.mp4
-      
-      - name: Add audio to video
+          set -euo pipefail
+          ls norm_*.mp4 | awk '{print "file '\''"$0"'\''"}' > files.txt
+          ffmpeg -y -f concat -safe 0 -i files.txt -r "$FPS" -c:v libx264 -pix_fmt yuv420p stack.mp4
+
+      - name: Loop stack to match audio length, overlay voiceover
         run: |
-          output_name="${{ github.event.client_payload.out_name }}"
-          
-          ffmpeg -i concatenated.mp4 -i audio.mp3 \
-            -c:v copy \
-            -c:a aac -b:a 192k \
+          set -euo pipefail
+          ffmpeg -y -stream_loop -1 -i stack.mp4 -i audio.mp3 \
+            -shortest -t "${{ steps.dur.outputs.dur }}" \
             -map 0:v:0 -map 1:a:0 \
-            -shortest \
-            -y "$output_name"
-          
-          echo "Final output:"
-          ls -lh "$output_name"
-      
+            -c:v libx264 -profile:v high -pix_fmt yuv420p -r "$FPS" \
+            -c:a aac -b:a 192k "$OUT_NAME"
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: rendered-reel
-          path: ${{ github.event.client_payload.out_name }}
-          retention-days: 7
+          name: reel-output
+          path: ${{ env.OUT_NAME }}
+          retention-days: 90
+
+      - name: Create release and upload asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="reel-${{ github.run_id }}"
+          REL=$(curl -s -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/${{ github.repository }}/releases \
+            -d "{\"tag_name\":\"$TAG\",\"name\":\"$TAG\"}")
+          UPLOAD_URL=$(echo "$REL" | jq -r .upload_url | sed 's/{?name,label}//')
+          curl -s -X POST -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Content-Type: video/mp4" \
+            --data-binary @"$OUT_NAME" \
+            "$UPLOAD_URL?name=$OUT_NAME"
