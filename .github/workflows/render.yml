@@ -39,7 +39,7 @@ jobs:
 
       - name: Download audio
         run: |
-          curl -L "$AUDIO_URL" -o audio.mp3
+          curl -L --fail --retry 3 "$AUDIO_URL" -o audio.mp3
 
       - name: Get audio duration seconds
         id: dur
@@ -49,13 +49,13 @@ jobs:
           if [ -z "$D" ] || [ "$D" = "N/A" ]; then D=60; fi
           echo "dur=$D" >> $GITHUB_OUTPUT
 
-      - name: Download up to 14 video clips from payload
+      - name: Download up to MAX_CLIPS video clips from payload
         run: |
           i=0
           jq -r '.video_urls[]' payload.json | while read URL; do
             i=$((i+1))
             [ $i -le $MAX_CLIPS ] || break
-            curl -L "$URL" -o "in_${i}.mp4"
+            curl -L --fail --retry 3 "$URL" -o "in_${i}.mp4"
           done
           ls -l in_*.mp4
 
