@@ -14,51 +14,75 @@ jobs:
       
       - name: Download videos
         run: |
-          echo "Downloading videos..."
-          IFS=',' read -ra URLS <<< "${{ join(github.event.client_payload.video_urls, ',') }}"
-          index=1
-          for url in "${URLS[@]}"; do
-            echo "Downloading video $index from $url"
-            curl -L -o "in_${index}.mp4" "$url"
+          echo "Video URLs: ${{ toJSON(github.event.client_payload.video_urls) }}"
+          
+          # Parse JSON array and download each video
+          echo '${{ toJSON(github.event.client_payload.video_urls) }}' | jq -r '.[]' | while IFS= read -r url; do
             index=$((index + 1))
+            echo "Downloading video $index from: $url"
+            curl -L -o "in_${index}.mp4" "$url" || echo "Failed to download $url"
           done
+          
+          # List downloaded files
+          ls -lh in_*.mp4
       
       - name: Download audio
         run: |
-          echo "Downloading audio from ${{ github.event.client_payload.audio_url }}"
+          echo "Downloading audio from: ${{ github.event.client_payload.audio_url }}"
           curl -L -o "audio.mp3" "${{ github.event.client_payload.audio_url }}"
+          ls -lh audio.mp3
       
-      - name: Normalize each clip to vertical and mute
+      - name: Normalize videos to vertical format
         run: |
-          for f in in_*.mp4; do
-            out="norm_${f#in_}"
-            echo "Processing $f -> $out"
-            ffmpeg -i "$f" \
-              -vf "scale='if(gt(iw/ih,9/16),1080,-2)':'if(gt(iw/ih,9/16),-2,1920)',crop=1080:1920" \
-              -an \
-              -c:v libx264 -preset fast -crf 23 \
-              "$out"
-          done
+          if ls in_*.mp4 1> /dev/null 2>&1; then
+            for f in in_*.mp4; do
+              out="norm_${f#in_}"
+              echo "Processing $f -> $out"
+              
+              # Scale and crop to 1080x1920 (9:16 aspect ratio)
+              ffmpeg -i "$f" \
+                -vf "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920" \
+                -an \
+                -c:v libx264 -preset fast -crf 23 \
+                -y "$out"
+            done
+          else
+            echo "No video files found!"
+            exit 1
+          fi
+          
+          # List processed files
+          ls -lh norm_*.mp4
       
       - name: Create concat list
         run: |
           for f in norm_*.mp4; do
             echo "file '$f'" >> concat.txt
           done
+          echo "Concat list:"
           cat concat.txt
       
-      - name: Concatenate clips
+      - name: Concatenate videos
         run: |
-          ffmpeg -f concat -safe 0 -i concat.txt -c copy concatenated.mp4
+          ffmpeg -f concat -safe 0 -i concat.txt \
+            -c copy \
+            -y concatenated.mp4
+          
+          ls -lh concatenated.mp4
       
-      - name: Add audio
+      - name: Add audio to video
         run: |
+          output_name="${{ github.event.client_payload.out_name }}"
+          
           ffmpeg -i concatenated.mp4 -i audio.mp3 \
             -c:v copy \
-            -c:a aac \
+            -c:a aac -b:a 192k \
             -map 0:v:0 -map 1:a:0 \
             -shortest \
-            "${{ github.event.client_payload.out_name }}"
+            -y "$output_name"
+          
+          echo "Final output:"
+          ls -lh "$output_name"
       
       - name: Upload artifact
         uses: actions/upload-artifact@v4
