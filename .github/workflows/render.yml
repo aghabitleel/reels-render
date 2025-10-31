@@ -11,6 +11,7 @@ jobs:
   render:
     runs-on: ubuntu-latest
     steps:
+      # 1) Tools
       - name: Set up FFmpeg
         uses: FedericoCarboni/setup-ffmpeg@v2
         with:
@@ -26,6 +27,7 @@ jobs:
           ffmpeg -version | head -n1
           jq --version
 
+      # 2) Input payload
       - name: Save payload
         run: |
           echo '${{ toJson(github.event.client_payload) }}' > payload.json
@@ -41,6 +43,7 @@ jobs:
           HEIGHT=$(jq -r '.height // 1920' payload.json)
           FPS=$(jq -r '.fps // 30' payload.json)
           MAX_CLIPS=$(jq -r '.max_clips // 14' payload.json)
+
           echo "AUDIO_URL=$AUDIO_URL" >> $GITHUB_ENV
           echo "OUT_NAME=$OUT_NAME" >> $GITHUB_ENV
           echo "WIDTH=$WIDTH" >> $GITHUB_ENV
@@ -48,6 +51,7 @@ jobs:
           echo "FPS=$FPS" >> $GITHUB_ENV
           echo "MAX_CLIPS=$MAX_CLIPS" >> $GITHUB_ENV
 
+      # 3) Download media
       - name: Download audio
         run: |
           set -euo pipefail
@@ -69,10 +73,12 @@ jobs:
           jq -r '.video_urls[]' payload.json | while read -r URL; do
             i=$((i+1))
             [ $i -le $MAX_CLIPS ] || break
+            echo "Downloading $URL -> in_${i}.mp4"
             curl -L --fail --retry 3 "$URL" -o "in_${i}.mp4"
           done
           ls -l in_*.mp4
 
+      # 4) Normalize and stitch
       - name: Normalize each clip to vertical and mute
         run: |
           set -euo pipefail
@@ -86,7 +92,7 @@ jobs:
             n=${f#in_}; n=${n%.mp4}
             echo "Processing $f -> norm_${n}.mp4"
             ffmpeg -y -i "$f" \
-              -vf "scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=cover,setsar=1,fps=${FPS}" \
+              -vf "scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=increase,crop=${WIDTH}:${HEIGHT},setsar=1,fps=${FPS}" \
               -an -c:v libx264 -preset veryfast -crf 18 -pix_fmt yuv420p "norm_${n}.mp4"
           done
 
@@ -105,6 +111,7 @@ jobs:
             -c:v libx264 -profile:v high -pix_fmt yuv420p -r "$FPS" \
             -c:a aac -b:a 192k "$OUT_NAME"
 
+      # 5) Outputs: artifact and release
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
