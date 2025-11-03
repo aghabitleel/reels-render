@@ -45,12 +45,11 @@ jobs:
           echo "FPS=$FPS" >> $GITHUB_ENV
           echo "MAX_CLIPS=$MAX_CLIPS" >> $GITHUB_ENV
 
-      - name: Download audio (friendly headers + retries)
+      - name: Download audio
         run: |
           set -euo pipefail
           UA="Mozilla/5.0 (X11; Linux x86_64; GH-Actions)"
           curl -L --fail --retry 5 --retry-delay 2 -A "$UA" "$AUDIO_URL" -o audio.bin
-          # Normalize to AAC in M4A so input format does not matter
           ffmpeg -y -i audio.bin -c:a aac -b:a 192k audio.m4a
 
       - name: Get audio duration
@@ -63,29 +62,24 @@ jobs:
           echo "dur=$DUR" >> $GITHUB_OUTPUT
           echo "Audio seconds: $DUR"
 
-      - name: Download up to MAX_CLIPS videos (friendly headers + retries)
+      - name: Download up to MAX_CLIPS videos
         run: |
           set -euo pipefail
           UA="Mozilla/5.0 (X11; Linux x86_64; GH-Actions)"
           i=0
-          ok=0
           jq -r '.video_urls[]' payload.json | while read -r URL; do
             i=$((i+1))
             [ $i -le $MAX_CLIPS ] || break
             echo "Downloading $URL -> in_${i}.mp4"
-            if curl -L --fail --retry 5 --retry-delay 2 -A "$UA" "$URL" -o "in_${i}.mp4"; then
-              ok=$((ok+1))
-            else
-              echo "Warning: failed to download $URL"
-            fi
+            curl -L --fail --retry 5 --retry-delay 2 -A "$UA" "$URL" -o "in_${i}.mp4" || echo "WARN failed $URL"
           done
-          ls -l in_*.mp4 || true
           shopt -s nullglob
           COUNT=(in_*.mp4)
           if [ ${#COUNT[@]} -eq 0 ]; then
-            echo "No videos downloaded. Common causes: 403 from host"
+            echo "No videos downloaded"
             exit 1
           fi
+          ls -l in_*.mp4
 
       - name: Normalize each clip to 9:16, mute
         run: |
@@ -93,40 +87,62 @@ jobs:
           shopt -s nullglob
           for f in in_*.mp4; do
             n=${f#in_}; n=${n%.mp4}
-            echo "Processing $f -> norm_${n}.mp4"
             ffmpeg -y -i "$f" \
               -vf "scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=increase,crop=${WIDTH}:${HEIGHT},setsar=1,fps=${FPS}" \
               -an -c:v libx264 -preset veryfast -crf 18 -pix_fmt yuv420p "norm_${n}.mp4"
           done
 
-      # NEW: force 5s segments and create enough chunks to cover the audio
-      - name: Make fixed-length chunks (5s each)
+      - name: Make 4s chunks (no repeat if enough files, varied offsets if not)
         env:
-          CHUNK_SEC: 5
+          CHUNK_SEC: 4
         run: |
           set -euo pipefail
           shopt -s nullglob
           files=(norm_*.mp4)
           if [ ${#files[@]} -eq 0 ]; then
-            echo "No normalized clips found"
-            exit 1
+            echo "No normalized clips found"; exit 1
           fi
 
           TARGET="${{ steps.dur.outputs.dur }}"
           CHUNK=${CHUNK_SEC}
-          # ceil(TARGET/CHUNK)
           NEED=$(( ( ${TARGET%.*} + CHUNK - 1 ) / CHUNK ))
-          if [ $NEED -le 0 ]; then NEED=1; fi
-          echo "Target seconds: $TARGET, chunk: $CHUNK, chunks needed: $NEED"
+          [ $NEED -gt 0 ] || NEED=1
+          echo "Need $NEED chunks of $CHUNK s"
+
+          # Cache durations
+          : > durs.txt
+          for f in "${files[@]}"; do
+            d=$(ffprobe -v error -show_entries format=duration -of default=nokey=1:noprint_wrappers=1 "$f" | cut -d. -f1)
+            [ -z "$d" ] && d=10
+            echo "$f $d" >> durs.txt
+          done
 
           rm -f chunks.txt
-          for ((n=0; n<NEED; n++)); do
-            f="${files[$(( n % ${#files[@]} ))]}"
-            out=$(printf "chunk_%04d.mp4" "$n")
-            ffmpeg -y -ss 0 -i "$f" -t "$CHUNK" \
-              -an -c:v libx264 -preset veryfast -crf 18 -r "$FPS" -pix_fmt yuv420p "$out"
-            echo "file '$out'" >> chunks.txt
-          done
+          FCOUNT=${#files[@]}
+
+          if [ $NEED -le $FCOUNT ]; then
+            # Enough unique files: use first NEED files, one 4s chunk each from start
+            for ((n=0; n<NEED; n++)); do
+              f="${files[$n]}"
+              out=$(printf "chunk_%04d.mp4" "$n")
+              ffmpeg -y -ss 0 -i "$f" -t "$CHUNK" -an -c:v libx264 -preset veryfast -crf 18 -r "$FPS" -pix_fmt yuv420p "$out"
+              echo "file '$out'" >> chunks.txt
+            done
+          else
+            # Not enough files: cycle files and shift start offset inside each source
+            for ((n=0; n<NEED; n++)); do
+              idx=$(( n % FCOUNT ))
+              f="${files[$idx]}"
+              fdur=$(awk -v k="$f" '$1==k{print $2}' durs.txt)
+              # shift start by groups of file set, wrap when reaching end
+              group=$(( n / FCOUNT ))
+              maxstart=$(( fdur > CHUNK ? fdur - CHUNK : 0 ))
+              start=$(( (group * CHUNK) % (maxstart + 1) ))
+              out=$(printf "chunk_%04d.mp4" "$n")
+              ffmpeg -y -ss "$start" -i "$f" -t "$CHUNK" -an -c:v libx264 -preset veryfast -crf 18 -r "$FPS" -pix_fmt yuv420p "$out"
+              echo "file '$out'" >> chunks.txt
+            done
+          fi
 
       - name: Concat chunks
         run: |
