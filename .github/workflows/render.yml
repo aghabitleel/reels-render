@@ -285,9 +285,9 @@ jobs:
 
             line="${LINES[$i]}"
 
-            # Wrap text to width WRAP_CHARS without breaking words, then join with \N
+            # Wrap text to width WRAP_CHARS without breaking words, join with \N (ASS newline)
             wrapped=$(printf '%s' "$line" | awk -v w="$WRAP_CHARS" '
-              function emit(s){ if(out!="") out=out "\\N" s; else out=s }
+              function emit(s){ gsub(/[ \t\r]+$/,"",s); if(out!="") out=out "\\N" s; else out=s }
               {
                 gsub(/\r/,"");
                 txt=$0;
@@ -304,10 +304,9 @@ jobs:
               END{ print out }
             ')
 
-            # Escape ASS control chars and braces
+            # Escape only braces; KEEP backslashes so \N remains a newline in ASS
             wrapped="${wrapped//'{'/'\\{}'}"
             wrapped="${wrapped//'}'/'\\}'}"
-            wrapped="${wrapped//\\/\\\\}"
 
             printf 'Dialogue: 0,%s,%s,Centered,,0,0,0,,{\\an5\\pos(540,960)\\blur0.6\\fad(100,80)\\t(0,200,\\fscx110\\fscy110)\\t(200,360,\\fscx100\\fscy100)}%s\n' \
               "$s_str" "$e_str" "$wrapped" >> subs.ass
