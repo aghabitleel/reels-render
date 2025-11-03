@@ -17,6 +17,7 @@ jobs:
 
       - name: Install jq and curl
         run: |
+          set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y jq curl
 
@@ -35,7 +36,7 @@ jobs:
           WIDTH=$(jq -r '.width // 1080' payload.json)
           HEIGHT=$(jq -r '.height // 1920' payload.json)
           FPS=$(jq -r '.fps // 30' payload.json)
-          MAX_CLIPS=$(jq -r '.max_clips // 14' payload.json)
+          MAX_CLIPS=$(jq -r '.max_clips // 25' payload.json)
 
           echo "AUDIO_URL=$AUDIO_URL" >> $GITHUB_ENV
           echo "OUT_NAME=$OUT_NAME" >> $GITHUB_ENV
@@ -49,7 +50,7 @@ jobs:
           set -euo pipefail
           UA="Mozilla/5.0 (X11; Linux x86_64; GH-Actions)"
           curl -L --fail --retry 5 --retry-delay 2 -A "$UA" "$AUDIO_URL" -o audio.bin
-          # normalize to mp3 or m4a as input extension doesn't matter
+          # Normalize to AAC in M4A so input format does not matter
           ffmpeg -y -i audio.bin -c:a aac -b:a 192k audio.m4a
 
       - name: Get audio duration
@@ -60,6 +61,7 @@ jobs:
           DUR=${DUR%.*}
           if [ -z "$DUR" ] || [ "$DUR" = "N/A" ]; then DUR=60; fi
           echo "dur=$DUR" >> $GITHUB_OUTPUT
+          echo "Audio seconds: $DUR"
 
       - name: Download up to MAX_CLIPS videos (friendly headers + retries)
         run: |
@@ -81,7 +83,7 @@ jobs:
           shopt -s nullglob
           COUNT=(in_*.mp4)
           if [ ${#COUNT[@]} -eq 0 ]; then
-            echo "No videos downloaded. Common causes: 403 from host. Use sources that allow direct downloads or host on S3/GCS/GitHub Releases."
+            echo "No videos downloaded. Common causes: 403 from host"
             exit 1
           fi
 
@@ -97,18 +99,40 @@ jobs:
               -an -c:v libx264 -preset veryfast -crf 18 -pix_fmt yuv420p "norm_${n}.mp4"
           done
 
-      - name: Concat or pass-through
+      # NEW: force 5s segments and create enough chunks to cover the audio
+      - name: Make fixed-length chunks (5s each)
+        env:
+          CHUNK_SEC: 5
         run: |
           set -euo pipefail
           shopt -s nullglob
           files=(norm_*.mp4)
-          if [ ${#files[@]} -eq 1 ]; then
-            echo "Single clip, using pass-through -> stack.mp4"
-            cp "${files[0]}" stack.mp4
-          else
-            printf "%s\n" "${files[@]}" | awk '{print "file '\''"$0"'\''"}' > files.txt
-            ffmpeg -y -f concat -safe 0 -i files.txt -c:v libx264 -pix_fmt yuv420p -r "$FPS" -movflags +faststart stack.mp4
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No normalized clips found"
+            exit 1
           fi
+
+          TARGET="${{ steps.dur.outputs.dur }}"
+          CHUNK=${CHUNK_SEC}
+          # ceil(TARGET/CHUNK)
+          NEED=$(( ( ${TARGET%.*} + CHUNK - 1 ) / CHUNK ))
+          if [ $NEED -le 0 ]; then NEED=1; fi
+          echo "Target seconds: $TARGET, chunk: $CHUNK, chunks needed: $NEED"
+
+          rm -f chunks.txt
+          for ((n=0; n<NEED; n++)); do
+            f="${files[$(( n % ${#files[@]} ))]}"
+            out=$(printf "chunk_%04d.mp4" "$n")
+            ffmpeg -y -ss 0 -i "$f" -t "$CHUNK" \
+              -an -c:v libx264 -preset veryfast -crf 18 -r "$FPS" -pix_fmt yuv420p "$out"
+            echo "file '$out'" >> chunks.txt
+          done
+
+      - name: Concat chunks
+        run: |
+          set -euo pipefail
+          ffmpeg -y -f concat -safe 0 -i chunks.txt \
+            -c:v libx264 -pix_fmt yuv420p -r "$FPS" -movflags +faststart stack.mp4
 
       - name: Fit to audio length and mux audio
         run: |
