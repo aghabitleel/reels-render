@@ -285,27 +285,29 @@ jobs:
 
             line="${LINES[$i]}"
 
-            # Wrap to multiple lines using Python textwrap, then convert newlines to \N
-            wrapped=$(printf '%s' "$line" | python3 - "$WRAP_CHARS" <<'PY'
-import sys, textwrap
-w = int(sys.argv[1])
-txt = sys.stdin.read().replace('\r','').strip()
-out_lines = []
-for para in txt.split('\n'):
-    para = para.strip()
-    if not para: 
-        continue
-    out_lines.extend(textwrap.wrap(para, width=w, break_long_words=False, break_on_hyphens=False))
-print("\n".join(out_lines))
-PY
-)
+            # Wrap text to width WRAP_CHARS without breaking words, then join with \N
+            wrapped=$(printf '%s' "$line" | awk -v w="$WRAP_CHARS" '
+              function emit(s){ if(out!="") out=out "\\N" s; else out=s }
+              {
+                gsub(/\r/,"");
+                txt=$0;
+                while (length(txt) > w) {
+                  br=w;
+                  for (i=w; i>=1; i--) { ch=substr(txt,i,1); if (ch==" "){ br=i; break } }
+                  if (br==0) br=w;
+                  emit(substr(txt,1,br));
+                  txt=substr(txt,br+1);
+                  sub(/^[ ]+/,"",txt);
+                }
+                emit(txt);
+              }
+              END{ print out }
+            ')
 
-            # Escape ASS chars and convert newlines to \N
+            # Escape ASS control chars and braces
             wrapped="${wrapped//'{'/'\\{}'}"
             wrapped="${wrapped//'}'/'\\}'}"
             wrapped="${wrapped//\\/\\\\}"
-            wrapped="${wrapped//$'\r'/}"
-            wrapped="${wrapped//$'\n'/\\N}"
 
             printf 'Dialogue: 0,%s,%s,Centered,,0,0,0,,{\\an5\\pos(540,960)\\blur0.6\\fad(100,80)\\t(0,200,\\fscx110\\fscy110)\\t(200,360,\\fscx100\\fscy100)}%s\n' \
               "$s_str" "$e_str" "$wrapped" >> subs.ass
