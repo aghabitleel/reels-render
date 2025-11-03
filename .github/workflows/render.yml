@@ -17,11 +17,11 @@ jobs:
         with:
           version: latest
 
-      - name: Install jq, curl, fonts
+      - name: Install jq and curl
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y jq curl fonts-dejavu-core
+          sudo apt-get install -y jq curl
 
       - name: Capture payload
         run: |
@@ -43,23 +43,22 @@ jobs:
           CHUNK_SEC=$(jq -r 'try .chunk_sec // 3' payload.json)
           MAX_CLIPS=$(jq -r 'try .max_clips // 100' payload.json)
 
+          # Normalize "null" literal to empty
           if [ "$RAW_AUDIO_URL" = "null" ]; then RAW_AUDIO_URL=""; fi
+
+          # Validate audio url
           if [ -z "$RAW_AUDIO_URL" ] || ! echo "$RAW_AUDIO_URL" | grep -Eiq '^https?://'; then
             echo "Error: client_payload.audio_url is missing or invalid"
             cat payload.json
             exit 1
           fi
 
-          # Build script.txt from any supported key
+          # Write optional script to script.txt (prefer array of lines)
           jq -r '
             if (.script_lines | type == "array") then
               .script_lines | map(tostring) | join("\n")
             elif (.script_text | type == "string") then
               .script_text
-            elif (.script | type == "string") then
-              .script
-            elif (.lines | type == "array") then
-              .lines | map(tostring) | join("\n")
             else
               ""
             end
@@ -72,10 +71,7 @@ jobs:
           echo "FPS=$FPS" >> $GITHUB_ENV
           echo "CHUNK_SEC=$CHUNK_SEC" >> $GITHUB_ENV
           echo "MAX_CLIPS=$MAX_CLIPS" >> $GITHUB_ENV
-
-          echo "---- script.txt first lines ----"
-          sed -n '1,5p' script.txt || true
-          echo "--------------------------------"
+          echo "Params: $OUT_NAME ${WIDTH}x${HEIGHT} ${FPS}fps chunk=${CHUNK_SEC}s max_clips=$MAX_CLIPS"
 
       - name: Validate video URLs list
         run: |
@@ -92,8 +88,9 @@ jobs:
         run: |
           set -euo pipefail
           UA="Mozilla/5.0 (X11; Linux x86_64; GH-Actions)"
-          echo "Audio URL starts with: ${AUDIO_URL:0:70}..."
+          echo "Audio URL starts with: ${AUDIO_URL:0,70}..."
           curl -L --fail --retry 5 --retry-delay 2 -A "$UA" "$AUDIO_URL" -o audio.bin
+          # Normalize to AAC-in-MP4 for reliable probing and muxing
           ffmpeg -y -i audio.bin -c:a aac -b:a 192k -movflags +faststart audio.m4a
 
       - name: Get audio duration (float)
@@ -108,14 +105,15 @@ jobs:
           fi
           if [ -z "$DUR" ] || [ "$DUR" = "N/A" ]; then DUR="60"; fi
           echo "dur=$DUR" >> $GITHUB_OUTPUT
-          printf "%s" "$DUR" > audio_dur.txt
           echo "Audio duration (s): $DUR"
+          printf "%s" "$DUR" > audio_dur.txt
 
       - name: Download videos
         run: |
           set -euo pipefail
           UA="Mozilla/5.0 (X11; Linux x86_64; GH-Actions)"
           i=0
+          # Flatten nested arrays and dedupe
           jq -r '[.video_urls] | flatten | unique[]' payload.json | while read -r URL; do
             i=$((i+1))
             [ $i -le $MAX_CLIPS ] || break
@@ -128,6 +126,7 @@ jobs:
             echo "No videos downloaded"
             exit 1
           fi
+          echo "Downloaded ${#COUNT[@]} inputs:"
           ls -l in_*.mp4
 
       - name: Normalize each clip to 9:16, mute
@@ -151,13 +150,15 @@ jobs:
             echo "No normalized clips found"; exit 1
           fi
 
-          TARGET="$(cat audio_dur.txt)"
+          TARGET="$(cat audio_dur.txt)"    # float seconds
           CHUNK="$CHUNK_SEC"
 
+          # ceil(TARGET / CHUNK) on floats via awk
           NEED=$(awk -v t="$TARGET" -v c="$CHUNK" 'BEGIN{print int(t/c + 0.999999)}')
           if [ "$NEED" -lt 1 ]; then NEED=1; fi
           echo "Need $NEED chunks of $CHUNK s to cover ~${TARGET}s"
 
+          # Gather per-file float durations
           : > durs.txt
           for f in "${files[@]}"; do
             d=$(ffprobe -v error -show_entries format=duration -of default=nokey=1:noprint_wrappers=1 "$f" || echo "0")
@@ -167,16 +168,22 @@ jobs:
           rm -f chunks.txt
           FCOUNT=${#files[@]}
 
+          # Build chunks. If we need more than available files, cycle and vary start so repeats are not identical.
           for ((n=0; n<NEED; n++)); do
             idx=$(( n % FCOUNT ))
             f="${files[$idx]}"
 
             fdur=$(awk -v k="$f" '$1==k{print $2}' durs.txt)
+            # max valid start so we have CHUNK seconds available
             maxstart=$(awk -v d="$fdur" -v c="$CHUNK" 'BEGIN{s=d-c; if(s<0)s=0; printf "%.3f", s}')
 
+            # spread start positions across repeated uses
             group=$(( n / FCOUNT ))
             start=$(awk -v g="$group" -v c="$CHUNK" -v m="$maxstart" 'BEGIN{
-              s=g*c; while (s>m && m>0) s-=m; if (s>m) s=0; printf "%.3f", s
+              s=g*c;
+              while (s>m && m>0) s-=m;
+              if (s>m) s=0;
+              printf "%.3f", s
             }')
 
             out=$(printf "chunk_%04d.mp4" "$n")
@@ -193,20 +200,22 @@ jobs:
             -c:v libx264 -pix_fmt yuv420p -r "$FPS" -movflags +faststart stack.mp4
 
       - name: Build centered ASS subtitles from script
-        id: buildsubs
         run: |
           set -euo pipefail
 
           if [ ! -s script.txt ]; then
-            echo "No script provided in payload; expected script_lines or script_text"
-            exit 1
+            echo "No script.txt, skipping subtitles."
+            : > subs.missing
+            exit 0
           fi
 
           TOTAL_SEC="$(cat audio_dur.txt)"
+          # Drop empty lines
           mapfile -t LINES < <(sed '/^\s*$/d' script.txt)
           if [ "${#LINES[@]}" -eq 0 ]; then
-            echo "Script empty after trimming."
-            exit 1
+            echo "script.txt has no non-empty lines, skipping subtitles."
+            : > subs.missing
+            exit 0
           fi
 
           total_chars=0
@@ -245,7 +254,6 @@ jobs:
 
           start=0
           pad=0.06
-          echo "Dialogue lines to write: ${#LINES[@]}"
 
           for i in "${!LINES[@]}"; do
             dur=$(awk -v t="$TOTAL_SEC" -v c="${chars[$i]}" -v sum="$total_chars" 'BEGIN{
@@ -253,6 +261,7 @@ jobs:
             }')
             end=$(awk -v a="$start" -v d="$dur" 'BEGIN{print a+d}')
 
+            # Force last line to end slightly before audio end to avoid cutoff
             if [ "$i" -eq "$(( ${#LINES[@]} - 1 ))" ]; then
               end=$(awk -v t="$TOTAL_SEC" -v p="$pad" 'BEGIN{e=t-p; if(e<0)e=0; print e}')
               ok=$(awk -v a="$start" -v e="$end" 'BEGIN{print (e>a)?1:0}')
@@ -274,82 +283,28 @@ jobs:
             start="$end"
           done
 
-          DIALOGUE_COUNT=$(grep -c '^Dialogue:' subs.ass || true)
-          echo "Dialogue count: $DIALOGUE_COUNT"
-          if [ "$DIALOGUE_COUNT" -lt 1 ]; then
-            echo "Failed to build any dialogue lines."
-            exit 1
-          fi
+          ls -l subs.ass || true
 
-          echo "subs_path=$(pwd)/subs.ass" >> $GITHUB_OUTPUT
-          head -n 20 subs.ass || true
-
-      - name: Burn subtitles and mux audio (ASS, fallback to drawtext)
+      - name: Burn subtitles and mux audio
         run: |
           set -euo pipefail
-          SUBPATH="$(pwd)/subs.ass"
-          FONT_FILE="/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 
-          set +e
+          FILTER_ARGS=()
+          if [ -s subs.ass ]; then
+            echo "Subtitles will be burned from subs.ass"
+            FILTER_ARGS=(-vf "subtitles=subs.ass")
+          else
+            echo "No subs.ass present, rendering without subtitles."
+          fi
+
+          # Loop video so it's longer than audio, then cut exactly at audio end.
           ffmpeg -y -stream_loop -1 -i stack.mp4 -i audio.m4a \
-            -vf "subtitles='${SUBPATH}':fontsdir=/usr/share/fonts" \
+            "${FILTER_ARGS[@]}" \
             -map 0:v:0 -map 1:a:0 \
             -shortest \
             -c:v libx264 -profile:v high -pix_fmt yuv420p -r "$FPS" \
             -c:a copy \
             -movflags +faststart "$OUT_NAME"
-          CODE=$?
-          set -e
-
-          if [ $CODE -ne 0 ]; then
-            echo "ASS burn failed, falling back to drawtext"
-            # Convert subs.ass timings into drawtext filter with between(t,start,end)
-            python3 - << 'PY' > filters.txt
-import re, sys
-from datetime import timedelta
-ass = open('subs.ass','r',encoding='utf-8',errors='ignore').read().splitlines()
-events = [l for l in ass if l.startswith('Dialogue:')]
-def time_to_sec(t):
-    h,m,s = t.split(':')
-    s,cs = s.split('.')
-    return int(h)*3600 + int(m)*60 + int(s) + int(cs)/100.0
-filters=[]
-y='(h/2)'
-x='(w/2)'
-font="/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-for ev in events:
-    # Dialogue: 0,0:00:00.00,0:00:02.50,Centered,...
-    m=re.match(r'Dialogue:\s*\d+,(?P<s>\d+:\d{2}:\d{2}\.\d{2}),(?P<e>\d+:\d{2}:\d{2}\.\d{2}),[^,]*,[^,]*,\d*,\d*,\d*,[^,]*,(?P<text>.*)$',ev)
-    if not m: 
-        continue
-    s=time_to_sec(m.group('s'))
-    e=time_to_sec(m.group('e'))
-    txt=m.group('text')
-    # strip ASS overrides like {\pos(...)}{\t(...)} etc.
-    txt=re.sub(r'\{[^}]*\}','',txt).strip()
-    # escape quotes and colons
-    txt=txt.replace('\\','\\\\').replace(':','\\:').replace("'", "\\'")
-    filters.append(
-        f"drawtext=fontfile='{font}':text='{txt}':x=(w-text_w)/2:y=(h-text_h)/2:fontsize=84:fontcolor=white:" \
-        f"borderw=6:shadowcolor=black@0.6:shadowx=0:shadowy=0:enable='between(t,{s:.2f},{e:.2f})'"
-    )
-print(",".join(filters))
-PY
-
-            F=$(cat filters.txt)
-            if [ -z "$F" ]; then
-              echo "No drawtext filters generated; giving up."
-              exit 1
-            fi
-
-            ffmpeg -y -stream_loop -1 -i stack.mp4 -i audio.m4a \
-              -vf "$F" \
-              -map 0:v:0 -map 1:a:0 \
-              -shortest \
-              -c:v libx264 -profile:v high -pix_fmt yuv420p -r "$FPS" \
-              -c:a copy \
-              -movflags +faststart "$OUT_NAME"
-          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
