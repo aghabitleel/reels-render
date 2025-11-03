@@ -20,6 +20,7 @@ jobs:
           version: latest
 
       - name: Install jq and curl
+        shell: bash
         run: |
           set -euo pipefail
           sudo apt-get update
@@ -29,7 +30,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Use a single-quoted here-doc so quotes in the JSON cannot break the shell
+          # Safe here-doc so quotes inside payload cannot break the shell
           cat > payload.json <<'JSON'
           ${{ toJson(github.event.client_payload) }}
           JSON
@@ -78,7 +79,6 @@ jobs:
           echo "FPS=$FPS" >> $GITHUB_ENV
           echo "CHUNK_SEC=$CHUNK_SEC" >> $GITHUB_ENV
           echo "MAX_CLIPS=$MAX_CLIPS" >> $GITHUB_ENV
-
           echo "Params: $OUT_NAME ${WIDTH}x${HEIGHT} ${FPS}fps chunk=${CHUNK_SEC}s max_clips=$MAX_CLIPS"
 
       - name: Validate video URLs list
@@ -312,9 +312,9 @@ jobs:
             FILTER_ARGS=(-vf "subtitles=subs.ass")
           else
             echo "No subs.ass present, rendering without subtitles."
-          fi
+          }
 
-          # Loop video so it outlasts audio, then cut exactly at audio end
+          # Loop video longer than audio, then cut exactly at audio end
           ffmpeg -y -stream_loop -1 -i stack.mp4 -i audio.m4a \
             "${FILTER_ARGS[@]}" \
             -map 0:v:0 -map 1:a:0 \
