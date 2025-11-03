@@ -36,13 +36,15 @@ jobs:
           WIDTH=$(jq -r '.width // 1080' payload.json)
           HEIGHT=$(jq -r '.height // 1920' payload.json)
           FPS=$(jq -r '.fps // 30' payload.json)
-          MAX_CLIPS=$(jq -r '.max_clips // 25' payload.json)
+          CHUNK_SEC=$(jq -r '.chunk_sec // 3' payload.json)
+          MAX_CLIPS=$(jq -r '.max_clips // 50' payload.json)
 
           echo "AUDIO_URL=$AUDIO_URL" >> $GITHUB_ENV
           echo "OUT_NAME=$OUT_NAME" >> $GITHUB_ENV
           echo "WIDTH=$WIDTH" >> $GITHUB_ENV
           echo "HEIGHT=$HEIGHT" >> $GITHUB_ENV
           echo "FPS=$FPS" >> $GITHUB_ENV
+          echo "CHUNK_SEC=$CHUNK_SEC" >> $GITHUB_ENV
           echo "MAX_CLIPS=$MAX_CLIPS" >> $GITHUB_ENV
 
       - name: Download audio
@@ -92,9 +94,7 @@ jobs:
               -an -c:v libx264 -preset veryfast -crf 18 -pix_fmt yuv420p "norm_${n}.mp4"
           done
 
-      - name: Make 4s chunks (no repeat if enough files, varied offsets if not)
-        env:
-          CHUNK_SEC: 4
+      - name: Make fixed-length chunks (3s default)
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -104,12 +104,11 @@ jobs:
           fi
 
           TARGET="${{ steps.dur.outputs.dur }}"
-          CHUNK=${CHUNK_SEC}
+          CHUNK="$CHUNK_SEC"
           NEED=$(( ( ${TARGET%.*} + CHUNK - 1 ) / CHUNK ))
           [ $NEED -gt 0 ] || NEED=1
           echo "Need $NEED chunks of $CHUNK s"
 
-          # Cache durations
           : > durs.txt
           for f in "${files[@]}"; do
             d=$(ffprobe -v error -show_entries format=duration -of default=nokey=1:noprint_wrappers=1 "$f" | cut -d. -f1)
@@ -121,7 +120,6 @@ jobs:
           FCOUNT=${#files[@]}
 
           if [ $NEED -le $FCOUNT ]; then
-            # Enough unique files: use first NEED files, one 4s chunk each from start
             for ((n=0; n<NEED; n++)); do
               f="${files[$n]}"
               out=$(printf "chunk_%04d.mp4" "$n")
@@ -129,14 +127,12 @@ jobs:
               echo "file '$out'" >> chunks.txt
             done
           else
-            # Not enough files: cycle files and shift start offset inside each source
             for ((n=0; n<NEED; n++)); do
               idx=$(( n % FCOUNT ))
               f="${files[$idx]}"
               fdur=$(awk -v k="$f" '$1==k{print $2}' durs.txt)
-              # shift start by groups of file set, wrap when reaching end
-              group=$(( n / FCOUNT ))
               maxstart=$(( fdur > CHUNK ? fdur - CHUNK : 0 ))
+              group=$(( n / FCOUNT ))
               start=$(( (group * CHUNK) % (maxstart + 1) ))
               out=$(printf "chunk_%04d.mp4" "$n")
               ffmpeg -y -ss "$start" -i "$f" -t "$CHUNK" -an -c:v libx264 -preset veryfast -crf 18 -r "$FPS" -pix_fmt yuv420p "$out"
