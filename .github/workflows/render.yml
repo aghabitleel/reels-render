@@ -43,7 +43,7 @@ jobs:
           CHUNK_SEC=$(jq -r 'try .chunk_sec // 3' payload.json)
           MAX_CLIPS=$(jq -r 'try .max_clips // 100' payload.json)
 
-          # Normalize "null" literal to empty
+          # Normalize literal "null" to empty
           if [ "$RAW_AUDIO_URL" = "null" ]; then RAW_AUDIO_URL=""; fi
 
           # Validate audio url
@@ -88,7 +88,7 @@ jobs:
         run: |
           set -euo pipefail
           UA="Mozilla/5.0 (X11; Linux x86_64; GH-Actions)"
-          echo "Audio URL starts with: ${AUDIO_URL:0,70}..."
+          echo "Audio URL starts with: ${AUDIO_URL:0:70}..."
           curl -L --fail --retry 5 --retry-delay 2 -A "$UA" "$AUDIO_URL" -o audio.bin
           # Normalize to AAC-in-MP4 for reliable probing and muxing
           ffmpeg -y -i audio.bin -c:a aac -b:a 192k -movflags +faststart audio.m4a
@@ -211,7 +211,7 @@ jobs:
 
           TOTAL_SEC="$(cat audio_dur.txt)"
           # Drop empty lines
-          mapfile -t LINES < <(sed '/^\s*$/d' script.txt)
+          mapfile -t LINES < <(sed '/^[[:space:]]*$/d' script.txt)
           if [ "${#LINES[@]}" -eq 0 ]; then
             echo "script.txt has no non-empty lines, skipping subtitles."
             : > subs.missing
@@ -236,21 +236,22 @@ jobs:
             }'
           }
 
-          cat > subs.ass <<'ASS'
-          [Script Info]
-          ScriptType: v4.00+
-          PlayResX: 1080
-          PlayResY: 1920
-          WrapStyle: 2
-          ScaledBorderAndShadow: yes
-
-          [V4+ Styles]
-          Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-          Style: Centered,DejaVu Sans Bold,84,&H00FFFFFF,&H00FFFFFF,&H00101010,&H96000000,1,0,0,0,100,100,0,0,1,6,4,5,80,80,120,1
-
-          [Events]
-          Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
-          ASS
+          # Write header and style with printf to avoid heredoc issues
+          : > subs.ass
+          printf '%s\n' \
+            '[Script Info]' \
+            'ScriptType: v4.00+' \
+            'PlayResX: 1080' \
+            'PlayResY: 1920' \
+            'WrapStyle: 2' \
+            'ScaledBorderAndShadow: yes' \
+            '' \
+            '[V4+ Styles]' \
+            'Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding' \
+            'Style: Centered,DejaVu Sans Bold,84,&H00FFFFFF,&H00FFFFFF,&H00101010,&H96000000,1,0,0,0,100,100,0,0,1,6,4,5,80,80,120,1' \
+            '' \
+            '[Events]' \
+            'Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text' >> subs.ass
 
           start=0
           pad=0.06
@@ -261,7 +262,7 @@ jobs:
             }')
             end=$(awk -v a="$start" -v d="$dur" 'BEGIN{print a+d}')
 
-            # Force last line to end slightly before audio end to avoid cutoff
+            # Last line ends a touch before the audio end
             if [ "$i" -eq "$(( ${#LINES[@]} - 1 ))" ]; then
               end=$(awk -v t="$TOTAL_SEC" -v p="$pad" 'BEGIN{e=t-p; if(e<0)e=0; print e}')
               ok=$(awk -v a="$start" -v e="$end" 'BEGIN{print (e>a)?1:0}')
@@ -275,10 +276,11 @@ jobs:
             line="${line//'{'/'\\{}'}"
             line="${line//'}'/'\\}'}"
             line="${line//\\/\\\\}"
-            line="${line//\r/}"
-            line="${line//$'\n'/ }"
+            line="${line//$(printf '\r')/}"
+            line="${line//$(printf '\n')/ }"
 
-            echo "Dialogue: 0,$s_str,$e_str,Centered,,0,0,0,,{\\pos(540,960)\\blur0.6\\fad(100,80)\\t(0,200,\\fscx110\\fscy110)\\t(200,360,\\fscx100\\fscy100)}$line" >> subs.ass
+            printf 'Dialogue: 0,%s,%s,Centered,,0,0,0,,{\\pos(540,960)\\blur0.6\\fad(100,80)\\t(0,200,\\fscx110\\fscy110)\\t(200,360,\\fscx100\\fscy100)}%s\n' \
+              "$s_str" "$e_str" "$line" >> subs.ass
 
             start="$end"
           done
@@ -297,7 +299,7 @@ jobs:
             echo "No subs.ass present, rendering without subtitles."
           fi
 
-          # Loop video so it's longer than audio, then cut exactly at audio end.
+          # Loop video so it is longer than audio, then cut exactly at audio end
           ffmpeg -y -stream_loop -1 -i stack.mp4 -i audio.m4a \
             "${FILTER_ARGS[@]}" \
             -map 0:v:0 -map 1:a:0 \
