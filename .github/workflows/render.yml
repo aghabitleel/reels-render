@@ -30,7 +30,7 @@ jobs:
           echo "Captured payload:"
           cat payload.json
 
-      - name: Read params
+      - name: Read and validate params
         id: params
         run: |
           set -euo pipefail
@@ -43,12 +43,26 @@ jobs:
           CHUNK_SEC=$(jq -r 'try .chunk_sec // 3' payload.json)
           MAX_CLIPS=$(jq -r 'try .max_clips // 100' payload.json)
 
+          # Normalize "null" literal to empty
           if [ "$RAW_AUDIO_URL" = "null" ]; then RAW_AUDIO_URL=""; fi
+
+          # Validate audio url
           if [ -z "$RAW_AUDIO_URL" ] || ! echo "$RAW_AUDIO_URL" | grep -Eiq '^https?://'; then
             echo "Error: client_payload.audio_url is missing or invalid"
             cat payload.json
             exit 1
           fi
+
+          # Write optional script to script.txt (prefer array of lines)
+          jq -r '
+            if (.script_lines | type == "array") then
+              .script_lines | map(tostring) | join("\n")
+            elif (.script_text | type == "string") then
+              .script_text
+            else
+              ""
+            end
+          ' payload.json > script.txt
 
           echo "AUDIO_URL=$RAW_AUDIO_URL" >> $GITHUB_ENV
           echo "OUT_NAME=$OUT_NAME" >> $GITHUB_ENV
@@ -57,6 +71,7 @@ jobs:
           echo "FPS=$FPS" >> $GITHUB_ENV
           echo "CHUNK_SEC=$CHUNK_SEC" >> $GITHUB_ENV
           echo "MAX_CLIPS=$MAX_CLIPS" >> $GITHUB_ENV
+          echo "Params: $OUT_NAME ${WIDTH}x${HEIGHT} ${FPS}fps chunk=${CHUNK_SEC}s max_clips=$MAX_CLIPS"
 
       - name: Validate video URLs list
         run: |
@@ -67,70 +82,39 @@ jobs:
             cat payload.json
             exit 1
           fi
-          echo "Video URL count: $COUNT"
-
-      - name: Prepare script.txt from payload
-        run: |
-          set -euo pipefail
-          : > script.txt
-
-          # 1) If script_lines array exists, write as-is (one line per item)
-          HAS_LINES=$(jq -r 'if (.script_lines and (.script_lines|type=="array") and (.script_lines|length>0)) then "yes" else "no" end' payload.json)
-          if [ "$HAS_LINES" = "yes" ]; then
-            jq -r '.script_lines[]' payload.json | sed '/^\s*$/d' > script.txt
-          else
-            # 2) Else, try script_text string and split into sentences
-            ST=$(jq -r 'try .script_text // ""' payload.json)
-            if [ "$ST" != "null" ] && [ -n "$ST" ]; then
-              printf "%s" "$ST" > __raw.txt
-              # Normalize whitespace
-              tr '\r' '\n' < __raw.txt | tr -s '\n' ' ' | sed 's/  */ /g' > __one.txt
-              # Split on ., !, ? keeping punctuation, then trim
-              awk '{
-                gsub(/\r/,"");
-                text=$0;
-                while (match(text, /[^.?!]*[.?!]/)) {
-                  s=substr(text, RSTART, RLENGTH);
-                  gsub(/^[[:space:]]+|[[:space:]]+$/, "", s);
-                  if (length(s)>0) print s;
-                  text=substr(text, RSTART+RLENGTH);
-                }
-                gsub(/^[[:space:]]+|[[:space:]]+$/, "", text);
-                if (length(text)>0) print text;
-              }' __one.txt > script.txt
-            fi
-          fi
-
-          echo "Script lines prepared:"
-          nl -ba script.txt | head -n 20 || true
+          echo "Video URL count in payload: $COUNT"
 
       - name: Download audio
         run: |
           set -euo pipefail
           UA="Mozilla/5.0 (X11; Linux x86_64; GH-Actions)"
-          echo "Audio URL: ${AUDIO_URL:0:80}..."
+          echo "Audio URL starts with: ${AUDIO_URL:0,70}..."
           curl -L --fail --retry 5 --retry-delay 2 -A "$UA" "$AUDIO_URL" -o audio.bin
+          # Normalize to AAC-in-MP4 for reliable probing and muxing
           ffmpeg -y -i audio.bin -c:a aac -b:a 192k -movflags +faststart audio.m4a
 
       - name: Get audio duration (float)
         id: dur
         run: |
           set -euo pipefail
-          DUR=$(ffprobe -v error -select_streams a:0 -show_entries stream=duration -of default=nokey=1:noprint_wrappers=1 audio.m4a || echo "")
+          DUR=$(ffprobe -v error -select_streams a:0 -show_entries stream=duration \
+                 -of default=nokey=1:noprint_wrappers=1 audio.m4a || echo "")
           if [ -z "$DUR" ] || [ "$DUR" = "N/A" ]; then
-            DUR=$(ffprobe -v error -show_entries format=duration -of default=nokey=1:noprint_wrappers=1 audio.m4a || echo "60")
+            DUR=$(ffprobe -v error -show_entries format=duration \
+                   -of default=nokey=1:noprint_wrappers=1 audio.m4a || echo "60")
           fi
           if [ -z "$DUR" ] || [ "$DUR" = "N/A" ]; then DUR="60"; fi
-          echo "$DUR" > audio_dur.txt
           echo "dur=$DUR" >> $GITHUB_OUTPUT
           echo "Audio duration (s): $DUR"
+          printf "%s" "$DUR" > audio_dur.txt
 
-      - name: Download up to MAX_CLIPS videos
+      - name: Download videos
         run: |
           set -euo pipefail
           UA="Mozilla/5.0 (X11; Linux x86_64; GH-Actions)"
           i=0
-          jq -r '.video_urls[]' payload.json | while read -r URL; do
+          # Flatten nested arrays and dedupe
+          jq -r '[.video_urls] | flatten | unique[]' payload.json | while read -r URL; do
             i=$((i+1))
             [ $i -le $MAX_CLIPS ] || break
             echo "Downloading $URL -> in_${i}.mp4"
@@ -166,13 +150,15 @@ jobs:
             echo "No normalized clips found"; exit 1
           fi
 
-          TARGET="$(cat audio_dur.txt)"   # float seconds
+          TARGET="$(cat audio_dur.txt)"    # float seconds
           CHUNK="$CHUNK_SEC"
 
+          # ceil(TARGET / CHUNK) on floats via awk
           NEED=$(awk -v t="$TARGET" -v c="$CHUNK" 'BEGIN{print int(t/c + 0.999999)}')
           if [ "$NEED" -lt 1 ]; then NEED=1; fi
           echo "Need $NEED chunks of $CHUNK s to cover ~${TARGET}s"
 
+          # Gather per-file float durations
           : > durs.txt
           for f in "${files[@]}"; do
             d=$(ffprobe -v error -show_entries format=duration -of default=nokey=1:noprint_wrappers=1 "$f" || echo "0")
@@ -182,12 +168,16 @@ jobs:
           rm -f chunks.txt
           FCOUNT=${#files[@]}
 
+          # Build chunks. If we need more than available files, cycle and vary start so repeats are not identical.
           for ((n=0; n<NEED; n++)); do
             idx=$(( n % FCOUNT ))
             f="${files[$idx]}"
 
             fdur=$(awk -v k="$f" '$1==k{print $2}' durs.txt)
+            # max valid start so we have CHUNK seconds available
             maxstart=$(awk -v d="$fdur" -v c="$CHUNK" 'BEGIN{s=d-c; if(s<0)s=0; printf "%.3f", s}')
+
+            # spread start positions across repeated uses
             group=$(( n / FCOUNT ))
             start=$(awk -v g="$group" -v c="$CHUNK" -v m="$maxstart" 'BEGIN{
               s=g*c;
@@ -212,15 +202,19 @@ jobs:
       - name: Build centered ASS subtitles from script
         run: |
           set -euo pipefail
+
           if [ ! -s script.txt ]; then
-            : > subs.ass
+            echo "No script.txt, skipping subtitles."
+            : > subs.missing
             exit 0
           fi
 
           TOTAL_SEC="$(cat audio_dur.txt)"
+          # Drop empty lines
           mapfile -t LINES < <(sed '/^\s*$/d' script.txt)
           if [ "${#LINES[@]}" -eq 0 ]; then
-            : > subs.ass
+            echo "script.txt has no non-empty lines, skipping subtitles."
+            : > subs.missing
             exit 0
           fi
 
@@ -267,10 +261,11 @@ jobs:
             }')
             end=$(awk -v a="$start" -v d="$dur" 'BEGIN{print a+d}')
 
+            # Force last line to end slightly before audio end to avoid cutoff
             if [ "$i" -eq "$(( ${#LINES[@]} - 1 ))" ]; then
               end=$(awk -v t="$TOTAL_SEC" -v p="$pad" 'BEGIN{e=t-p; if(e<0)e=0; print e}')
               ok=$(awk -v a="$start" -v e="$end" 'BEGIN{print (e>a)?1:0}')
-              if [ "$ok" -ne 1 ]; then end=$(awk -v a="$start" 'BEGIN{print a+0.7}') ; fi
+              if [ "$ok" -ne 1 ]; then end=$(awk -v a="$start" 'BEGIN{print a+0.7}'); fi
             fi
 
             s_str=$(fmt_time "$start")
@@ -288,15 +283,23 @@ jobs:
             start="$end"
           done
 
-          echo "Built subs.ass:"
-          head -n 25 subs.ass || true
+          ls -l subs.ass || true
 
       - name: Burn subtitles and mux audio
         run: |
           set -euo pipefail
-          # Loop video, burn centered ASS subs, end exactly with audio, keep audio intact
+
+          FILTER_ARGS=()
+          if [ -s subs.ass ]; then
+            echo "Subtitles will be burned from subs.ass"
+            FILTER_ARGS=(-vf "subtitles=subs.ass")
+          else
+            echo "No subs.ass present, rendering without subtitles."
+          fi
+
+          # Loop video so it's longer than audio, then cut exactly at audio end.
           ffmpeg -y -stream_loop -1 -i stack.mp4 -i audio.m4a \
-            -vf "subtitles=subs.ass" \
+            "${FILTER_ARGS[@]}" \
             -map 0:v:0 -map 1:a:0 \
             -shortest \
             -c:v libx264 -profile:v high -pix_fmt yuv420p -r "$FPS" \
