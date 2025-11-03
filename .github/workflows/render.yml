@@ -275,7 +275,7 @@ jobs:
             }')
             end=$(awk -v a="$start" -v d="$dur" 'BEGIN{print a+d}')
 
-            # Last line ends slightly before audio end
+            # Last line ends slightly before the audio end
             if [ "$i" -eq "$(( ${#LINES[@]} - 1 ))" ]; then
               end=$(awk -v t="$TOTAL_SEC" -v p="$pad" 'BEGIN{e=t-p; if(e<0)e=0; print e}')
               ok=$(awk -v a="$start" -v e="$end" 'BEGIN{print (e>a)?1:0}')
@@ -312,7 +312,7 @@ jobs:
             FILTER_ARGS=(-vf "subtitles=subs.ass")
           else
             echo "No subs.ass present, rendering without subtitles."
-          }
+          fi
 
           # Loop video longer than audio, then cut exactly at audio end
           ffmpeg -y -stream_loop -1 -i stack.mp4 -i audio.m4a \
