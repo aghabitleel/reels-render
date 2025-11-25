@@ -260,7 +260,7 @@ jobs:
             '' \
             '[V4+ Styles]' \
             'Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding' \
-            'Style: Centered,DejaVu Sans Bold,72,&H00FFFFFF,&H00FFFFFF,&H00101010,&H96000000,1,0,0,0,100,100,0,0,1,6,4,5,80,80,150,1' \
+            'Style: Centered,DejaVu Sans Bold,58,&H00FFFFFF,&H00FFFFFF,&H00101010,&H96000000,1,0,0,0,100,100,0,0,1,5,3,5,100,100,150,1' \
             '' \
             '[Events]' \
             'Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text' >> subs.ass
