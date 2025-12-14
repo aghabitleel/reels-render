@@ -262,19 +262,19 @@ jobs:
             }'
           }
 
-          # Initialize ASS file with smaller font for better fit
+          # Initialize ASS file with smaller font and proper wrapping
           : > subs.ass
           printf '%s\n' \
             '[Script Info]' \
             'ScriptType: v4.00+' \
             'PlayResX: 1080' \
             'PlayResY: 1920' \
-            'WrapStyle: 2' \
+            'WrapStyle: 0' \
             'ScaledBorderAndShadow: yes' \
             '' \
             '[V4+ Styles]' \
             'Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding' \
-            'Style: Centered,DejaVu Sans Bold,64,&H00FFFFFF,&H00FFFFFF,&H00101010,&H96000000,1,0,0,0,100,100,0,0,1,5,3,5,50,50,150,1' \
+            'Style: Centered,DejaVu Sans Bold,56,&H00FFFFFF,&H00FFFFFF,&H00101010,&H96000000,1,0,0,0,100,100,0,0,1,4,2,5,80,80,150,1' \
             '' \
             '[Events]' \
             'Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text' >> subs.ass
@@ -282,12 +282,12 @@ jobs:
           start=0
           MIN_DURATION=0.3  # Minimum duration per word
           pad=0.06
-          WORDS_PER_CHUNK=4  # Show 4 words at a time for better fit
+          WORDS_PER_CHUNK=3  # Show 3 words at a time for guaranteed fit
 
-          # Process words in chunks of 4
+          # Process words in chunks of 3
           i=0
           while [ $i -lt ${#WORDS[@]} ]; do
-            # Determine chunk size (up to 4 words)
+            # Determine chunk size (up to 3 words)
             chunk_end=$((i + WORDS_PER_CHUNK))
             if [ $chunk_end -gt ${#WORDS[@]} ]; then
               chunk_end=${#WORDS[@]}
@@ -306,6 +306,7 @@ jobs:
               print d;
             }')
             
+            chunk_start_time=$start
             chunk_end_time=$(awk -v a="$start" -v d="$chunk_duration" 'BEGIN{print a+d}')
             
             # Handle last chunk - ensure it doesn't exceed audio duration
@@ -315,7 +316,25 @@ jobs:
               [ "$ok" -ne 1 ] && chunk_end_time=$(awk -v a="$start" 'BEGIN{print a+1.0}')
             fi
             
-            # Now create individual subtitle events for each word in this chunk
+            # Build the full sentence text (all white) - this stays visible the whole time
+            full_text=""
+            for ((k=i; k<chunk_end; k++)); do
+              word="${WORDS[k]}"
+              esc="${word//'{'/'\{'}"
+              esc="${esc//'}'/'\}'}"
+              full_text="${full_text}${esc}"
+              if [ $k -lt $((chunk_end - 1)) ]; then
+                full_text="${full_text} "
+              fi
+            done
+            
+            # Create base layer with all white text for entire chunk duration
+            chunk_s_str=$(fmt_time "$chunk_start_time")
+            chunk_e_str=$(fmt_time "$chunk_end_time")
+            printf 'Dialogue: 0,%s,%s,Centered,,0,0,0,,{\\an5\\pos(540,960)\\blur0.5}%s\n' \
+              "$chunk_s_str" "$chunk_e_str" "$full_text" >> subs.ass
+            
+            # Now create individual yellow highlight overlays for each word
             word_start=$start
             for ((j=i; j<chunk_end; j++)); do
               word_len=${word_chars[j]}
@@ -337,7 +356,7 @@ jobs:
               s_str=$(fmt_time "$word_start")
               e_str=$(fmt_time "$word_end")
               
-              # Build the sentence showing all words in chunk
+              # Build text with only current word in yellow (this overlays on top)
               text=""
               for ((k=i; k<chunk_end; k++)); do
                 word="${WORDS[k]}"
@@ -345,21 +364,20 @@ jobs:
                 esc="${esc//'}'/'\}'}"
                 
                 if [ $k -eq $j ]; then
-                  # Current word: yellow (no animation)
+                  # Current word: yellow
                   text="${text}{\\c&H00FFFF&}${esc}{\\c&H00FFFFFF&}"
                 else
-                  # Other words: white
-                  text="${text}${esc}"
+                  # Other words: transparent (invisible on this layer)
+                  text="${text}{\\alpha&HFF&}${esc}{\\alpha&H00&}"
                 fi
                 
-                # Add space between words (except after last word)
                 if [ $k -lt $((chunk_end - 1)) ]; then
                   text="${text} "
                 fi
               done
               
-              # Write subtitle line
-              printf 'Dialogue: 0,%s,%s,Centered,,0,0,0,,{\\an5\\pos(540,960)\\blur0.6\\fad(100,80)}%s\n' \
+              # Write yellow highlight overlay on top layer
+              printf 'Dialogue: 1,%s,%s,Centered,,0,0,0,,{\\an5\\pos(540,960)\\blur0.5}%s\n' \
                 "$s_str" "$e_str" "$text" >> subs.ass
               
               word_start=$word_end
