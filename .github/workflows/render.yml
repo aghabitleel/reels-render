@@ -210,7 +210,7 @@ jobs:
           ffmpeg -y -f concat -safe 0 -i chunks.txt \
             -c:v libx264 -pix_fmt yuv420p -r "$FPS" -movflags +faststart stack.mp4
 
-      - name: Build word-by-word ASS subtitles (2 words at a time)
+      - name: Build animated 3-word sliding subtitles
         shell: bash
         run: |
           set -euo pipefail
@@ -253,6 +253,33 @@ jobs:
             total_chars=$(( total_chars + c ))
           done
 
+          # Calculate timing for each individual word
+          declare -a word_start
+          declare -a word_end
+          
+          MIN_DURATION=0.3  # Minimum duration per word
+          current_time=0
+          
+          for i in "${!WORDS[@]}"; do
+            word_start[$i]=$current_time
+            
+            # Calculate duration based on character proportion
+            dur=$(awk -v t="$TOTAL_SEC" -v c="${word_chars[$i]}" -v sum="$total_chars" -v min="$MIN_DURATION" 'BEGIN{
+              d=t*(c/sum); 
+              if (d<min) d=min; 
+              print d;
+            }')
+            
+            current_time=$(awk -v a="$current_time" -v d="$dur" 'BEGIN{print a+d}')
+            word_end[$i]=$current_time
+          done
+
+          # Adjust last word to not exceed total duration
+          if [ ${#WORDS[@]} -gt 0 ]; then
+            last_idx=$(( ${#WORDS[@]} - 1 ))
+            word_end[$last_idx]=$(awk -v t="$TOTAL_SEC" 'BEGIN{print t-0.05}')
+          fi
+
           fmt_time () {
             awk -v t="$1" 'BEGIN{
               if (t<0) t=0;
@@ -262,7 +289,7 @@ jobs:
             }'
           }
 
-          # Initialize ASS file
+          # Initialize ASS file with two styles: normal and highlighted
           : > subs.ass
           printf '%s\n' \
             '[Script Info]' \
@@ -274,62 +301,63 @@ jobs:
             '' \
             '[V4+ Styles]' \
             'Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding' \
-            'Style: Centered,DejaVu Sans Bold,72,&H00FFFFFF,&H00FFFFFF,&H00101010,&H96000000,1,0,0,0,100,100,0,0,1,5,3,5,100,100,150,1' \
+            'Style: Normal,DejaVu Sans Bold,68,&H00CCCCCC,&H00CCCCCC,&H00101010,&H96000000,1,0,0,0,100,100,0,0,1,4,3,5,100,100,150,1' \
+            'Style: Active,DejaVu Sans Bold,68,&H00FFFF00,&H00FFFF00,&H00101010,&H96000000,1,0,0,0,100,100,0,0,1,5,4,5,100,100,150,1' \
             '' \
             '[Events]' \
             'Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text' >> subs.ass
 
-          start=0
-          MIN_DURATION=0.5  # Minimum duration per word pair
-          pad=0.06
-
-          # Process words in pairs
-          i=0
-          while [ $i -lt ${#WORDS[@]} ]; do
-            # Get 2 words (or 1 if it's the last word)
-            word1="${WORDS[$i]}"
-            word2=""
-            pair_chars=${word_chars[$i]}
+          # Generate subtitles with sliding 3-word window
+          for i in "${!WORDS[@]}"; do
+            # Get current word timing
+            start_time="${word_start[$i]}"
+            end_time="${word_end[$i]}"
+            
+            # Build 3-word context (previous, current, next)
+            prev_word=""
+            curr_word="${WORDS[$i]}"
+            next_word=""
+            
+            if [ $i -gt 0 ]; then
+              prev_word="${WORDS[$(( i - 1 ))]}"
+            fi
             
             if [ $(( i + 1 )) -lt ${#WORDS[@]} ]; then
-              word2=" ${WORDS[$(( i + 1 ))]}"
-              pair_chars=$(( pair_chars + ${word_chars[$(( i + 1 ))]} ))
+              next_word="${WORDS[$(( i + 1 ))]}"
             fi
             
-            text="${word1}${word2}"
+            # Escape special characters for ASS
+            prev_word="${prev_word//'{'/'\{'}"
+            prev_word="${prev_word//'}'/'\}'}"
+            curr_word="${curr_word//'{'/'\{'}"
+            curr_word="${curr_word//'}'/'\}'}"
+            next_word="${next_word//'{'/'\{'}"
+            next_word="${next_word//'}'/'\}'}"
             
-            # Calculate duration based on character proportion
-            dur=$(awk -v t="$TOTAL_SEC" -v c="$pair_chars" -v sum="$total_chars" -v min="$MIN_DURATION" 'BEGIN{
-              d=t*(c/sum); 
-              if (d<min) d=min; 
-              print d;
-            }')
+            s_str=$(fmt_time "$start_time")
+            e_str=$(fmt_time "$end_time")
             
-            end=$(awk -v a="$start" -v d="$dur" 'BEGIN{print a+d}')
-
-            # Handle last pair - ensure it doesn't exceed audio duration
-            if [ $(( i + 2 )) -ge ${#WORDS[@]} ]; then
-              end=$(awk -v t="$TOTAL_SEC" -v p="$pad" 'BEGIN{e=t-p; if(e<0)e=0; print e}')
-              ok=$(awk -v a="$start" -v e="$end" 'BEGIN{print (e>a)?1:0}')
-              [ "$ok" -ne 1 ] && end=$(awk -v a="$start" 'BEGIN{print a+0.7}')
+            # Build the subtitle line with color tags
+            # Previous word in gray, current word in yellow (animated), next word in gray
+            line=""
+            
+            if [ -n "$prev_word" ]; then
+              line="$line{\\c&HCCCCCC&}$prev_word "
             fi
-
-            s_str=$(fmt_time "$start")
-            e_str=$(fmt_time "$end")
-
-            # Escape braces for ASS format
-            escaped="${text//'{'/'\{'}"
-            escaped="${escaped//'}'/'\}'}"
-
-            # Write subtitle with fade and scale animation
-            printf 'Dialogue: 0,%s,%s,Centered,,0,0,0,,{\\an5\\pos(540,960)\\blur0.6\\fad(100,80)\\t(0,150,\\fscx110\\fscy110)\\t(150,300,\\fscx100\\fscy100)}%s\n' \
-              "$s_str" "$e_str" "$escaped" >> subs.ass
-
-            start="$end"
-            i=$(( i + 2 ))  # Move to next pair
+            
+            # Current word with scale animation and bright color
+            line="$line{\\c&H00FFFF&\\t(0,100,\\fscx115\\fscy115)\\t(100,200,\\fscx100\\fscy100)}$curr_word"
+            
+            if [ -n "$next_word" ]; then
+              line="$line {\\c&HCCCCCC&}$next_word"
+            fi
+            
+            # Write subtitle event
+            printf 'Dialogue: 0,%s,%s,Normal,,0,0,0,,{\\an5\\pos(540,960)\\blur0.5\\fad(80,80)}%s\n' \
+              "$s_str" "$e_str" "$line" >> subs.ass
           done
 
-          echo "Generated word-by-word subtitles: $(wc -l < subs.ass) lines"
+          echo "Generated animated 3-word subtitles: $(wc -l < subs.ass) lines"
           ls -l subs.ass || true
 
       - name: Burn subtitles and mux audio
