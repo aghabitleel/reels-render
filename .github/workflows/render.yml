@@ -210,7 +210,7 @@ jobs:
           ffmpeg -y -f concat -safe 0 -i chunks.txt \
             -c:v libx264 -pix_fmt yuv420p -r "$FPS" -movflags +faststart stack.mp4
 
-      - name: Build word-by-word ASS subtitles (2 words, animation on current only)
+      - name: Build word-by-word ASS subtitles (sentences with moving highlight)
         shell: bash
         run: |
           set -euo pipefail
@@ -282,53 +282,92 @@ jobs:
           start=0
           MIN_DURATION=0.3  # Minimum duration per word
           pad=0.06
+          WORDS_PER_CHUNK=5  # Show 5 words at a time
 
-          # Process each word individually
-          for i in "${!WORDS[@]}"; do
-            word="${WORDS[$i]}"
-            word_len=${word_chars[$i]}
+          # Process words in chunks of 5
+          i=0
+          while [ $i -lt ${#WORDS[@]} ]; do
+            # Determine chunk size (up to 5 words)
+            chunk_end=$((i + WORDS_PER_CHUNK))
+            if [ $chunk_end -gt ${#WORDS[@]} ]; then
+              chunk_end=${#WORDS[@]}
+            fi
+            chunk_size=$((chunk_end - i))
             
-            # Calculate duration based on character proportion
-            dur=$(awk -v t="$TOTAL_SEC" -v c="$word_len" -v sum="$total_chars" -v min="$MIN_DURATION" 'BEGIN{
+            # Calculate total duration for this chunk
+            chunk_chars=0
+            for ((j=i; j<chunk_end; j++)); do
+              chunk_chars=$((chunk_chars + word_chars[j]))
+            done
+            
+            chunk_duration=$(awk -v t="$TOTAL_SEC" -v c="$chunk_chars" -v sum="$total_chars" -v min="$MIN_DURATION" -v size="$chunk_size" 'BEGIN{
               d=t*(c/sum); 
-              if (d<min) d=min; 
+              if (d<(min*size)) d=min*size; 
               print d;
             }')
             
-            end=$(awk -v a="$start" -v d="$dur" 'BEGIN{print a+d}')
-
-            # Handle last word - ensure it doesn't exceed audio duration
-            if [ $(( i + 1 )) -ge ${#WORDS[@]} ]; then
-              end=$(awk -v t="$TOTAL_SEC" -v p="$pad" 'BEGIN{e=t-p; if(e<0)e=0; print e}')
-              ok=$(awk -v a="$start" -v e="$end" 'BEGIN{print (e>a)?1:0}')
-              [ "$ok" -ne 1 ] && end=$(awk -v a="$start" 'BEGIN{print a+0.7}')
-            fi
-
-            s_str=$(fmt_time "$start")
-            e_str=$(fmt_time "$end")
-
-            # Escape braces for ASS format
-            esc="${word//'{'/'\{'}"
-            esc="${esc//'}'/'\}'}"
+            chunk_end_time=$(awk -v a="$start" -v d="$chunk_duration" 'BEGIN{print a+d}')
             
-            # Build text: current word (yellow, animated) + next word (white, static)
-            if [ $(( i + 1 )) -lt ${#WORDS[@]} ]; then
-              next_word="${WORDS[$(( i + 1 ))]}"
-              next_esc="${next_word//'{'/'\{'}"
-              next_esc="${next_esc//'}'/'\}'}"
-              
-              # Yellow animated current word, then reset animation and make next word white
-              text="{\\c&H00FFFF&\\t(0,150,\\fscx110\\fscy110)\\t(150,300,\\fscx100\\fscy100)}${esc}{\\r\\c&H00FFFFFF&} ${next_esc}"
-            else
-              # Last word - just yellow and animated
-              text="{\\c&H00FFFF&\\t(0,150,\\fscx110\\fscy110)\\t(150,300,\\fscx100\\fscy100)}${esc}"
+            # Handle last chunk - ensure it doesn't exceed audio duration
+            if [ $chunk_end -ge ${#WORDS[@]} ]; then
+              chunk_end_time=$(awk -v t="$TOTAL_SEC" -v p="$pad" 'BEGIN{e=t-p; if(e<0)e=0; print e}')
+              ok=$(awk -v a="$start" -v e="$chunk_end_time" 'BEGIN{print (e>a)?1:0}')
+              [ "$ok" -ne 1 ] && chunk_end_time=$(awk -v a="$start" 'BEGIN{print a+1.0}')
             fi
-
-            # Write single centered subtitle line
-            printf 'Dialogue: 0,%s,%s,Centered,,0,0,0,,{\\an5\\pos(540,960)\\blur0.6\\fad(100,80)}%s\n' \
-              "$s_str" "$e_str" "$text" >> subs.ass
-
-            start="$end"
+            
+            # Now create individual subtitle events for each word in this chunk
+            word_start=$start
+            for ((j=i; j<chunk_end; j++)); do
+              word_len=${word_chars[j]}
+              
+              # Calculate this word's duration proportional to chunk duration
+              word_duration=$(awk -v total="$chunk_duration" -v c="$word_len" -v sum="$chunk_chars" -v min="$MIN_DURATION" 'BEGIN{
+                d=total*(c/sum); 
+                if (d<min) d=min; 
+                print d;
+              }')
+              
+              word_end=$(awk -v a="$word_start" -v d="$word_duration" 'BEGIN{print a+d}')
+              
+              # Make sure last word in chunk doesn't exceed chunk end
+              if [ $j -eq $((chunk_end - 1)) ]; then
+                word_end=$chunk_end_time
+              fi
+              
+              s_str=$(fmt_time "$word_start")
+              e_str=$(fmt_time "$word_end")
+              
+              # Build the sentence showing all words in chunk
+              text=""
+              for ((k=i; k<chunk_end; k++)); do
+                word="${WORDS[k]}"
+                esc="${word//'{'/'\{'}"
+                esc="${esc//'}'/'\}'}"
+                
+                if [ $k -eq $j ]; then
+                  # Current word: yellow and animated
+                  text="${text}{\\c&H00FFFF&\\t(0,150,\\fscx110\\fscy110)\\t(150,300,\\fscx100\\fscy100)}${esc}{\\r\\c&H00FFFFFF&}"
+                else
+                  # Other words: white and static
+                  text="${text}${esc}"
+                fi
+                
+                # Add space between words (except after last word)
+                if [ $k -lt $((chunk_end - 1)) ]; then
+                  text="${text} "
+                fi
+              done
+              
+              # Write subtitle line
+              printf 'Dialogue: 0,%s,%s,Centered,,0,0,0,,{\\an5\\pos(540,960)\\blur0.6\\fad(100,80)}%s\n' \
+                "$s_str" "$e_str" "$text" >> subs.ass
+              
+              word_start=$word_end
+            done
+            
+            # Move to next chunk
+            i=$chunk_end
+            start=$chunk_end_time
           done
 
           echo "Generated word-by-word subtitles: $(wc -l < subs.ass) lines"
