@@ -210,7 +210,7 @@ jobs:
           ffmpeg -y -f concat -safe 0 -i chunks.txt \
             -c:v libx264 -pix_fmt yuv420p -r "$FPS" -movflags +faststart stack.mp4
 
-      - name: Build karaoke-style sentence subtitles
+      - name: Build word-by-word ASS subtitles (2 words at a time)
         shell: bash
         run: |
           set -euo pipefail
@@ -223,63 +223,35 @@ jobs:
 
           TOTAL_SEC="$(cat audio_dur.txt)"
           
-          # Read script lines (each line is a sentence)
-          mapfile -t LINES < <(sed '/^[[:space:]]*$/d' script.txt)
+          # Combine all lines into one text block
+          TEXT=$(sed '/^[[:space:]]*$/d' script.txt | tr '\n' ' ' | sed 's/  */ /g')
           
-          if [ "${#LINES[@]}" -eq 0 ]; then
-            echo "script.txt has no lines, skipping subtitles."
+          if [ -z "$TEXT" ]; then
+            echo "script.txt has no content, skipping subtitles."
             : > subs.missing
             exit 0
           fi
 
-          echo "Total sentences: ${#LINES[@]}"
-
-          # Split all text into words for timing
-          ALL_TEXT=$(printf '%s\n' "${LINES[@]}" | tr '\n' ' ' | sed 's/  */ /g')
-          mapfile -t ALL_WORDS < <(echo "$ALL_TEXT" | tr ' ' '\n' | sed '/^[[:space:]]*$/d')
+          # Split into words array
+          mapfile -t WORDS < <(echo "$TEXT" | tr ' ' '\n' | sed '/^[[:space:]]*$/d')
           
-          if [ "${#ALL_WORDS[@]}" -eq 0 ]; then
+          if [ "${#WORDS[@]}" -eq 0 ]; then
             echo "No words found, skipping subtitles."
             : > subs.missing
             exit 0
           fi
 
-          echo "Total words: ${#ALL_WORDS[@]}"
+          echo "Total words: ${#WORDS[@]}"
 
-          # Calculate timing for each word
+          # Calculate total characters for timing distribution
           total_chars=0
           declare -a word_chars
-          for i in "${!ALL_WORDS[@]}"; do
-            c=${#ALL_WORDS[$i]}
+          for i in "${!WORDS[@]}"; do
+            c=${#WORDS[$i]}
             [ "$c" -lt 1 ] && c=1
             word_chars[$i]=$c
             total_chars=$(( total_chars + c ))
           done
-
-          declare -a word_start
-          declare -a word_end
-          
-          MIN_DURATION=0.35
-          current_time=0
-          
-          for i in "${!ALL_WORDS[@]}"; do
-            word_start[$i]=$current_time
-            
-            dur=$(awk -v t="$TOTAL_SEC" -v c="${word_chars[$i]}" -v sum="$total_chars" -v min="$MIN_DURATION" 'BEGIN{
-              d=t*(c/sum); 
-              if (d<min) d=min; 
-              print d;
-            }')
-            
-            current_time=$(awk -v a="$current_time" -v d="$dur" 'BEGIN{print a+d}')
-            word_end[$i]=$current_time
-          done
-
-          # Adjust last word
-          if [ ${#ALL_WORDS[@]} -gt 0 ]; then
-            last_idx=$(( ${#ALL_WORDS[@]} - 1 ))
-            word_end[$last_idx]=$(awk -v t="$TOTAL_SEC" 'BEGIN{print t-0.05}')
-          fi
 
           fmt_time () {
             awk -v t="$1" 'BEGIN{
@@ -302,68 +274,62 @@ jobs:
             '' \
             '[V4+ Styles]' \
             'Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding' \
-            'Style: Default,DejaVu Sans Bold,68,&H00FFFFFF,&H00FFFFFF,&H00000000,&H96000000,1,0,0,0,100,100,0,0,1,5,3,5,50,50,150,1' \
+            'Style: Centered,DejaVu Sans Bold,72,&H00FFFFFF,&H00FFFFFF,&H00101010,&H96000000,1,0,0,0,100,100,0,0,1,5,3,5,100,100,150,1' \
             '' \
             '[Events]' \
             'Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text' >> subs.ass
 
-          # Process each sentence
-          word_idx=0
-          
-          for line_idx in "${!LINES[@]}"; do
-            sentence="${LINES[$line_idx]}"
+          start=0
+          MIN_DURATION=0.5  # Minimum duration per word pair
+          pad=0.06
+
+          # Process words in pairs
+          i=0
+          while [ $i -lt ${#WORDS[@]} ]; do
+            # Get 2 words (or 1 if it's the last word)
+            word1="${WORDS[$i]}"
+            word2=""
+            pair_chars=${word_chars[$i]}
             
-            # Split sentence into words
-            mapfile -t SENTENCE_WORDS < <(echo "$sentence" | tr ' ' '\n' | sed '/^[[:space:]]*$/d')
-            
-            if [ "${#SENTENCE_WORDS[@]}" -eq 0 ]; then
-              continue
+            if [ $(( i + 1 )) -lt ${#WORDS[@]} ]; then
+              word2=" ${WORDS[$(( i + 1 ))]}"
+              pair_chars=$(( pair_chars + ${word_chars[$(( i + 1 ))]} ))
             fi
             
-            # Get timing for this sentence (from first word to last word)
-            sentence_start="${word_start[$word_idx]}"
-            sentence_end_idx=$(( word_idx + ${#SENTENCE_WORDS[@]} - 1 ))
-            sentence_end="${word_end[$sentence_end_idx]}"
+            text="${word1}${word2}"
             
-            # For each word in this sentence, create a subtitle showing full sentence
-            # with only the current word highlighted in yellow
-            for sent_word_idx in "${!SENTENCE_WORDS[@]}"; do
-              global_idx=$(( word_idx + sent_word_idx ))
-              
-              start_time="${word_start[$global_idx]}"
-              end_time="${word_end[$global_idx]}"
-              
-              s_str=$(fmt_time "$start_time")
-              e_str=$(fmt_time "$end_time")
-              
-              # Build the sentence with current word highlighted
-              line=""
-              for j in "${!SENTENCE_WORDS[@]}"; do
-                word="${SENTENCE_WORDS[$j]}"
-                
-                # Escape special characters
-                word="${word//'{'/'\{'}"
-                word="${word//'}'/'\}'}"
-                
-                if [ $j -eq $sent_word_idx ]; then
-                  # Current word: YELLOW with bounce animation
-                  line="$line{\\c&H00FFFF&\\t(0,120,\\fscx120\\fscy120)\\t(120,240,\\fscx100\\fscy100)}$word{\\r} "
-                else
-                  # Other words: WHITE, no animation
-                  line="$line{\\c&HFFFFFF&}$word{\\r} "
-                fi
-              done
-              
-              # Write subtitle event
-              printf 'Dialogue: 0,%s,%s,Default,,0,0,0,,{\\an5\\pos(540,960)\\blur0.4\\fad(100,100)}%s\n' \
-                "$s_str" "$e_str" "$line" >> subs.ass
-            done
+            # Calculate duration based on character proportion
+            dur=$(awk -v t="$TOTAL_SEC" -v c="$pair_chars" -v sum="$total_chars" -v min="$MIN_DURATION" 'BEGIN{
+              d=t*(c/sum); 
+              if (d<min) d=min; 
+              print d;
+            }')
             
-            # Move to next sentence
-            word_idx=$(( word_idx + ${#SENTENCE_WORDS[@]} ))
+            end=$(awk -v a="$start" -v d="$dur" 'BEGIN{print a+d}')
+
+            # Handle last pair - ensure it doesn't exceed audio duration
+            if [ $(( i + 2 )) -ge ${#WORDS[@]} ]; then
+              end=$(awk -v t="$TOTAL_SEC" -v p="$pad" 'BEGIN{e=t-p; if(e<0)e=0; print e}')
+              ok=$(awk -v a="$start" -v e="$end" 'BEGIN{print (e>a)?1:0}')
+              [ "$ok" -ne 1 ] && end=$(awk -v a="$start" 'BEGIN{print a+0.7}')
+            fi
+
+            s_str=$(fmt_time "$start")
+            e_str=$(fmt_time "$end")
+
+            # Escape braces for ASS format
+            escaped="${text//'{'/'\{'}"
+            escaped="${escaped//'}'/'\}'}"
+
+            # Write subtitle with fade and scale animation
+            printf 'Dialogue: 0,%s,%s,Centered,,0,0,0,,{\\an5\\pos(540,960)\\blur0.6\\fad(100,80)\\t(0,150,\\fscx110\\fscy110)\\t(150,300,\\fscx100\\fscy100)}%s\n' \
+              "$s_str" "$e_str" "$escaped" >> subs.ass
+
+            start="$end"
+            i=$(( i + 2 ))  # Move to next pair
           done
 
-          echo "Generated karaoke-style subtitles: $(wc -l < subs.ass) lines"
+          echo "Generated word-by-word subtitles: $(wc -l < subs.ass) lines"
           ls -l subs.ass || true
 
       - name: Burn subtitles and mux audio
