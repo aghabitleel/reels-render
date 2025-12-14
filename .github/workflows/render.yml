@@ -210,7 +210,7 @@ jobs:
           ffmpeg -y -f concat -safe 0 -i chunks.txt \
             -c:v libx264 -pix_fmt yuv420p -r "$FPS" -movflags +faststart stack.mp4
 
-      - name: Build animated 3-word sliding subtitles
+      - name: Build viral-style forward-reading subtitles
         shell: bash
         run: |
           set -euo pipefail
@@ -257,7 +257,7 @@ jobs:
           declare -a word_start
           declare -a word_end
           
-          MIN_DURATION=0.3  # Minimum duration per word
+          MIN_DURATION=0.35  # Minimum duration per word
           current_time=0
           
           for i in "${!WORDS[@]}"; do
@@ -289,7 +289,7 @@ jobs:
             }'
           }
 
-          # Initialize ASS file with two styles: normal and highlighted
+          # Initialize ASS file
           : > subs.ass
           printf '%s\n' \
             '[Script Info]' \
@@ -301,63 +301,65 @@ jobs:
             '' \
             '[V4+ Styles]' \
             'Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding' \
-            'Style: Normal,DejaVu Sans Bold,68,&H00CCCCCC,&H00CCCCCC,&H00101010,&H96000000,1,0,0,0,100,100,0,0,1,4,3,5,100,100,150,1' \
-            'Style: Active,DejaVu Sans Bold,68,&H00FFFF00,&H00FFFF00,&H00101010,&H96000000,1,0,0,0,100,100,0,0,1,5,4,5,100,100,150,1' \
+            'Style: Default,DejaVu Sans Bold,70,&H00FFFFFF,&H00FFFFFF,&H00000000,&H96000000,1,0,0,0,100,100,0,0,1,5,3,5,50,50,150,1' \
             '' \
             '[Events]' \
             'Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text' >> subs.ass
 
-          # Generate subtitles with sliding 3-word window
+          # Generate subtitles showing CURRENT + NEXT 2 words
+          # Current word: Yellow with pop animation
+          # Next words: Gray for context
+          
           for i in "${!WORDS[@]}"; do
-            # Get current word timing
             start_time="${word_start[$i]}"
             end_time="${word_end[$i]}"
             
-            # Build 3-word context (previous, current, next)
-            prev_word=""
+            # Current word being spoken
             curr_word="${WORDS[$i]}"
-            next_word=""
             
-            if [ $i -gt 0 ]; then
-              prev_word="${WORDS[$(( i - 1 ))]}"
-            fi
+            # Next 2 words for context
+            next1=""
+            next2=""
             
             if [ $(( i + 1 )) -lt ${#WORDS[@]} ]; then
-              next_word="${WORDS[$(( i + 1 ))]}"
+              next1="${WORDS[$(( i + 1 ))]}"
+            fi
+            
+            if [ $(( i + 2 )) -lt ${#WORDS[@]} ]; then
+              next2="${WORDS[$(( i + 2 ))]}"
             fi
             
             # Escape special characters for ASS
-            prev_word="${prev_word//'{'/'\{'}"
-            prev_word="${prev_word//'}'/'\}'}"
             curr_word="${curr_word//'{'/'\{'}"
             curr_word="${curr_word//'}'/'\}'}"
-            next_word="${next_word//'{'/'\{'}"
-            next_word="${next_word//'}'/'\}'}"
+            next1="${next1//'{'/'\{'}"
+            next1="${next1//'}'/'\}'}"
+            next2="${next2//'{'/'\{'}"
+            next2="${next2//'}'/'\}'}"
             
             s_str=$(fmt_time "$start_time")
             e_str=$(fmt_time "$end_time")
             
-            # Build the subtitle line with color tags
-            # Previous word in gray, current word in yellow (animated), next word in gray
-            line=""
+            # Build the subtitle line:
+            # CURRENT WORD in bright yellow with bounce animation
+            # Next words in gray (dimmed)
             
-            if [ -n "$prev_word" ]; then
-              line="$line{\\c&HCCCCCC&}$prev_word "
+            line="{\\c&H00FFFF&\\t(0,120,\\fscx120\\fscy120)\\t(120,240,\\fscx100\\fscy100)}$curr_word"
+            
+            if [ -n "$next1" ]; then
+              line="$line {\\c&H999999&\\alpha&H60&}$next1"
             fi
             
-            # Current word with scale animation and bright color
-            line="$line{\\c&H00FFFF&\\t(0,100,\\fscx115\\fscy115)\\t(100,200,\\fscx100\\fscy100)}$curr_word"
-            
-            if [ -n "$next_word" ]; then
-              line="$line {\\c&HCCCCCC&}$next_word"
+            if [ -n "$next2" ]; then
+              line="$line {\\c&H999999&\\alpha&H80&}$next2"
             fi
             
-            # Write subtitle event
-            printf 'Dialogue: 0,%s,%s,Normal,,0,0,0,,{\\an5\\pos(540,960)\\blur0.5\\fad(80,80)}%s\n' \
+            # Write subtitle event centered on screen
+            printf 'Dialogue: 0,%s,%s,Default,,0,0,0,,{\\an5\\pos(540,960)\\blur0.4\\fad(60,60)}%s\n' \
               "$s_str" "$e_str" "$line" >> subs.ass
           done
 
-          echo "Generated animated 3-word subtitles: $(wc -l < subs.ass) lines"
+          echo "Generated viral-style subtitles: $(wc -l < subs.ass) lines"
           ls -l subs.ass || true
 
       - name: Burn subtitles and mux audio
