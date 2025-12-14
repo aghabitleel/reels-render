@@ -296,8 +296,6 @@ jobs:
               pair_chars=$(( pair_chars + ${word_chars[$(( i + 1 ))]} ))
             fi
             
-            text="${word1}${word2}"
-            
             # Calculate duration based on character proportion
             dur=$(awk -v t="$TOTAL_SEC" -v c="$pair_chars" -v sum="$total_chars" -v min="$MIN_DURATION" 'BEGIN{
               d=t*(c/sum); 
@@ -317,13 +315,24 @@ jobs:
             s_str=$(fmt_time "$start")
             e_str=$(fmt_time "$end")
 
-            # Escape braces for ASS format
-            escaped="${text//'{'/'\{'}"
-            escaped="${escaped//'}'/'\}'}"
+            # Escape braces for ASS format - word1 will be yellow/animated, word2 will be white/static
+            esc1="${word1//'{'/'\{'}"
+            esc1="${esc1//'}'/'\}'}"
+            
+            # Build text with color codes: yellow animated first word, white static second word
+            if [ -n "$word2" ]; then
+              esc2="${word2//'{'/'\{'}"
+              esc2="${esc2//'}'/'\}'}"
+              # Yellow (&H00FFFF) for first word with animation, white (&H00FFFFFF) for second word without animation
+              text="{\\c&H00FFFF&\\t(0,150,\\fscx110\\fscy110)\\t(150,300,\\fscx100\\fscy100)}${esc1}{\\c&H00FFFFFF&\\fscx100\\fscy100}${esc2}"
+            else
+              # Last word - just yellow and animated
+              text="{\\c&H00FFFF&\\t(0,150,\\fscx110\\fscy110)\\t(150,300,\\fscx100\\fscy100)}${esc1}"
+            fi
 
-            # Write subtitle with fade and scale animation
-            printf 'Dialogue: 0,%s,%s,Centered,,0,0,0,,{\\an5\\pos(540,960)\\blur0.6\\fad(100,80)\\t(0,150,\\fscx110\\fscy110)\\t(150,300,\\fscx100\\fscy100)}%s\n' \
-              "$s_str" "$e_str" "$escaped" >> subs.ass
+            # Write subtitle with fade and positioning
+            printf 'Dialogue: 0,%s,%s,Centered,,0,0,0,,{\\an5\\pos(540,960)\\blur0.6\\fad(100,80)}%s\n' \
+              "$s_str" "$e_str" "$text" >> subs.ass
 
             start="$end"
             i=$(( i + 2 ))  # Move to next pair
