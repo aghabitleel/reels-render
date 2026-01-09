@@ -51,8 +51,7 @@ jobs:
           MAX_CLIPS=$(jq -r 'try .max_clips // 100' payload.json)
           LAYOUT_TYPE=$(jq -r 'try .layout_config.type // "single"' payload.json)
 
-          # Shift the talking head DOWN inside the bottom half (pixels).
-          # We will NOT blur-fill, we will "fit + pad" so the entire head stays visible.
+          # Shift down inside bottom half (pixels). With FIT+PAD this will not crop the head.
           BOTTOM_SHIFT_PX=$(jq -r 'try .layout_config.bottom_shift_px // 0' payload.json)
 
           # Slowdown factor for bottom video (1.0 = normal, 1.25 = 25% slower)
@@ -218,7 +217,7 @@ jobs:
             done
           fi
 
-      - name: Normalize BOTTOM clip (split-screen only), fit + pad so the entire head is visible (no blur), and slow down
+      - name: Normalize BOTTOM clip (split-screen only), fit + pad (no blur), keep full head visible, slow down
         shell: bash
         run: |
           set -euo pipefail
@@ -231,14 +230,17 @@ jobs:
             if [ "$SHIFT" -lt 0 ]; then SHIFT=0; fi
             if [ "$SHIFT" -gt 600 ]; then SHIFT=600; fi
 
-            echo "Normalizing BOTTOM: bottom_half=${BOTTOM_HEIGHT}px, shift_down=${SHIFT}px, speed=${BOTTOM_SPEED} (fit+pad, no blur, no cropping head)"
+            echo "Normalizing BOTTOM: bottom_half=${BOTTOM_HEIGHT}px, shift_down=${SHIFT}px, speed=${BOTTOM_SPEED} (fit+pad, no blur, no head cropping)"
 
-            # Key idea:
-            # 1) Scale to FIT inside bottom half (no crop) -> force_original_aspect_ratio=decrease
-            # 2) Pad to exact bottom-half size. We offset the video down by SHIFT but clamp so it never goes out of frame.
-            # This guarantees no duplicated blurry strip and keeps the full head visible.
+            # IMPORTANT:
+            # - We FIT (no crop) using force_original_aspect_ratio=decrease
+            # - We PAD to exact bottom-half size
+            # - We clamp Y so the image never goes out of bounds
+            # - Commas inside min/max must be escaped as \,
+            Y_EXPR="min(max(${SHIFT}\,0)\,oh-ih)"
+
             ffmpeg -y -i "bottom.mp4" \
-              -vf "fps=${FPS},setsar=1,setpts=PTS*${BOTTOM_SPEED},scale=${WIDTH}:${BOTTOM_HEIGHT}:force_original_aspect_ratio=decrease,pad=${WIDTH}:${BOTTOM_HEIGHT}:(ow-iw)/2:min(max(${SHIFT},0),oh-ih)" \
+              -vf "fps=${FPS},setsar=1,setpts=PTS*${BOTTOM_SPEED},scale=${WIDTH}:${BOTTOM_HEIGHT}:force_original_aspect_ratio=decrease,pad=${WIDTH}:${BOTTOM_HEIGHT}:(ow-iw)/2:'${Y_EXPR}'" \
               -an \
               -c:v libx264 -preset veryfast -crf 18 -pix_fmt yuv420p -g $((FPS*2)) "norm_bottom.mp4"
           fi
