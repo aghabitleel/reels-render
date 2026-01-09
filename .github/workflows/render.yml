@@ -51,9 +51,11 @@ jobs:
           MAX_CLIPS=$(jq -r 'try .max_clips // 100' payload.json)
           LAYOUT_TYPE=$(jq -r 'try .layout_config.type // "single"' payload.json)
 
-          # How much to push the bottom video down inside its half (pixels of top padding)
-          # Increase to push the talking head lower.
+          # Push bottom video framing down by cropping higher up (no black padding)
           BOTTOM_PAD_PX=$(jq -r 'try .layout_config.bottom_pad_px // 180' payload.json)
+
+          # Slow bottom video slightly (1.08 = 8% slower). Increase to slow more.
+          BOTTOM_SLOW_FACTOR=$(jq -r 'try .layout_config.bottom_slow_factor // 1.08' payload.json)
 
           if [ "$RAW_AUDIO_URL" = "null" ]; then RAW_AUDIO_URL=""; fi
 
@@ -82,7 +84,8 @@ jobs:
           echo "MAX_CLIPS=$MAX_CLIPS" >> $GITHUB_ENV
           echo "LAYOUT_TYPE=$LAYOUT_TYPE" >> $GITHUB_ENV
           echo "BOTTOM_PAD_PX=$BOTTOM_PAD_PX" >> $GITHUB_ENV
-          echo "Params: $OUT_NAME ${WIDTH}x${HEIGHT} ${FPS}fps chunk=${CHUNK_SEC}s layout=$LAYOUT_TYPE bottom_pad_px=$BOTTOM_PAD_PX"
+          echo "BOTTOM_SLOW_FACTOR=$BOTTOM_SLOW_FACTOR" >> $GITHUB_ENV
+          echo "Params: $OUT_NAME ${WIDTH}x${HEIGHT} ${FPS}fps chunk=${CHUNK_SEC}s layout=$LAYOUT_TYPE bottom_pad_px=$BOTTOM_PAD_PX bottom_slow_factor=$BOTTOM_SLOW_FACTOR"
 
       - name: Validate video URLs list
         shell: bash
@@ -205,7 +208,7 @@ jobs:
             done
           fi
 
-      - name: Normalize BOTTOM clip (split-screen only), push it down more
+      - name: Normalize BOTTOM clip (split-screen only), push framing down without black bars
         shell: bash
         run: |
           set -euo pipefail
@@ -214,21 +217,19 @@ jobs:
             BOTTOM_HEIGHT=$((HEIGHT / 2))
             PAD="${BOTTOM_PAD_PX}"
 
-            # Keep pad sane
+            if [ "$PAD" = "null" ] || [ -z "$PAD" ]; then PAD=0; fi
             if [ "$PAD" -lt 0 ]; then PAD=0; fi
-            if [ "$PAD" -gt 400 ]; then PAD=400; fi
+            if [ "$PAD" -gt 500 ]; then PAD=500; fi
 
-            INNER_H=$((BOTTOM_HEIGHT - PAD))
-            if [ "$INNER_H" -lt 300 ]; then
-              INNER_H=$((BOTTOM_HEIGHT - 120))
-              PAD=$((BOTTOM_HEIGHT - INNER_H))
-            fi
+            # We scale to a slightly taller frame then crop the bottom-half window starting at y=PAD.
+            # This shifts the visible portion downward without introducing a black rectangle.
+            TARGET_H=$((BOTTOM_HEIGHT + PAD))
+            if [ "$TARGET_H" -lt $BOTTOM_HEIGHT ]; then TARGET_H=$BOTTOM_HEIGHT; fi
 
-            echo "Normalizing BOTTOM clip (talking head), bottom_half_height=${BOTTOM_HEIGHT}px, inner=${INNER_H}px, top_pad=${PAD}px"
+            echo "Normalizing BOTTOM: bottom_half=${BOTTOM_HEIGHT}px, pad=${PAD}px, temp_scale_height=${TARGET_H}px"
 
-            # Scale/crop to INNER_H, then pad to full bottom half height with top padding to push video lower
             ffmpeg -y -i "bottom.mp4" \
-              -vf "scale=${WIDTH}:${INNER_H}:force_original_aspect_ratio=increase,crop=${WIDTH}:${INNER_H},pad=${WIDTH}:${BOTTOM_HEIGHT}:0:${PAD}:black,setsar=1,fps=${FPS}" \
+              -vf "scale=${WIDTH}:${TARGET_H}:force_original_aspect_ratio=increase,crop=${WIDTH}:${TARGET_H},crop=${WIDTH}:${BOTTOM_HEIGHT}:0:${PAD},setsar=1,fps=${FPS}" \
               -an -c:v libx264 -preset veryfast -crf 18 -pix_fmt yuv420p -g $((FPS*2)) "norm_bottom.mp4"
           fi
 
@@ -261,6 +262,7 @@ jobs:
           CHUNK="$CHUNK_SEC"
           TOP_HEIGHT=$((HEIGHT / 2))
           BOTTOM_HEIGHT=$((HEIGHT / 2))
+          SLOW="${BOTTOM_SLOW_FACTOR}"
 
           NEED=$(awk -v t="$TARGET" -v c="$CHUNK" 'BEGIN{print int(t/c + 0.999999)}')
           if [ "$NEED" -lt 1 ]; then NEED=1; fi
@@ -293,15 +295,14 @@ jobs:
 
             out=$(printf "chunk_%04d.mp4" "$n")
 
-            echo "Chunk $n: TOP[$top_idx start=$top_start] + BOTTOM[loop] -> $out"
+            echo "Chunk $n: TOP[$top_idx start=$top_start] + BOTTOM[loop slow=${SLOW}] -> $out"
 
-            # IMPORTANT: video-only chunks (no audio mapping here)
             ffmpeg -hide_banner -y \
               -ss "$top_start" -i "$top_file" -t "$CHUNK" \
-              -stream_loop -1 -i "norm_bottom.mp4" -t "$CHUNK" \
+              -stream_loop -1 -i "norm_bottom.mp4" \
               -filter_complex "
-                [0:v]scale=${WIDTH}:${TOP_HEIGHT}[top];
-                [1:v]scale=${WIDTH}:${BOTTOM_HEIGHT}[bottom];
+                [0:v]scale=${WIDTH}:${TOP_HEIGHT},trim=duration=${CHUNK},setpts=PTS-STARTPTS[top];
+                [1:v]scale=${WIDTH}:${BOTTOM_HEIGHT},setpts=PTS*${SLOW},fps=${FPS},trim=duration=${CHUNK},setpts=PTS-STARTPTS[bottom];
                 [top][bottom]vstack=inputs=2[stacked]
               " \
               -map "[stacked]" \
@@ -428,13 +429,9 @@ jobs:
             }'
           }
 
-          # Caption position: centered horizontally, 1/3 up from the bottom half
-          # bottom half starts at HEIGHT/2 and ends at HEIGHT
           CAPTION_X=$((WIDTH / 2))
           CAPTION_Y=$(( (HEIGHT / 2) + (HEIGHT / 2) * 2 / 3 ))
 
-          # Style: like TikTok/Reels (big bold, thick black outline, light shadow, no box)
-          # ASS colors are BGR. White = &H00FFFFFF, outline black = &H00000000
           : > subs.ass
           printf '%s\n' \
             '[Script Info]' \
@@ -498,11 +495,9 @@ jobs:
             chunk_s_str=$(fmt_time "$chunk_start_time")
             chunk_e_str=$(fmt_time "$chunk_end_time")
 
-            # Base line: full chunk in white
             printf 'Dialogue: 0,%s,%s,Reels,,0,0,0,,{\\an5\\pos(%d,%d)\\blur0.4\\fad(80,80)}%s\n' \
               "$chunk_s_str" "$chunk_e_str" "$CAPTION_X" "$CAPTION_Y" "$full_text" >> subs.ass
 
-            # Overlay lines: highlight one word at a time in yellow, others transparent so the base stays visible
             word_start=$start
             for ((j=i; j<chunk_end; j++)); do
               word_len=${word_chars[j]}
@@ -528,10 +523,8 @@ jobs:
                 esc="${esc//'}'/'\}'}"
 
                 if [ $k -eq $j ]; then
-                  # Yellow highlight (BGR): &H00FFFF& with same outline/shadow via the style
                   text="${text}{\\c&H00FFFF&}${esc}{\\c&H00FFFFFF&}"
                 else
-                  # Hide non-highlight words on overlay
                   text="${text}{\\alpha&HFF&}${esc}{\\alpha&H00&}"
                 fi
 
