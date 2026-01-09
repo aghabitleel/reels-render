@@ -293,7 +293,7 @@ jobs:
               -map "[stacked]" -map 1:a:0 \
               -c:v libx264 -preset veryfast -crf 18 -pix_fmt yuv420p -r "$FPS" \
               -c:a aac -b:a 128k \
-              -g $((FPS*2)) "$out" 2>&1 | grep -E "frame=|error" || true
+              -g $((FPS*2)) "$out"
             
             echo "file '$out'" >> chunks.txt
           done
@@ -304,6 +304,9 @@ jobs:
           fi
           
           echo "Created $(grep -c file chunks.txt || echo 0) chunks"
+          ls -lah chunk_*.mp4 2>/dev/null || true
+          echo "First lines of chunks.txt:"
+          head -n 20 chunks.txt || true
 
       - name: Make fixed-length chunks (single mode)
         shell: bash
@@ -358,12 +361,60 @@ jobs:
             echo "file '$out'" >> chunks.txt
           done
 
-      - name: Concat chunks
+          if [ ! -s chunks.txt ]; then
+            echo "Error: chunks.txt not created in single mode"
+            exit 1
+          fi
+
+          echo "Created $(grep -c file chunks.txt || echo 0) chunks"
+          ls -lah chunk_*.mp4 2>/dev/null || true
+          echo "First lines of chunks.txt:"
+          head -n 20 chunks.txt || true
+
+      - name: Concat chunks (robust)
         shell: bash
         run: |
           set -euo pipefail
-          ffmpeg -y -f concat -safe 0 -i chunks.txt \
+
+          echo "== Pre-concat debug =="
+          pwd
+          ls -lah
+          ls -lah chunk_*.mp4 2>/dev/null || true
+          ls -lah chunks.txt 2>/dev/null || true
+
+          # If chunks.txt is missing or empty, rebuild it from chunk files
+          if [ ! -s chunks.txt ]; then
+            echo "chunks.txt missing or empty, rebuilding from chunk files..."
+            mapfile -t CHUNKS < <(find . -maxdepth 5 -type f \( -name "chunk_*.mp4" -o -name "chunk-*.mp4" \) | sort)
+
+            if [ "${#CHUNKS[@]}" -eq 0 ]; then
+              echo "ERROR: No chunk mp4 files found, cannot concat."
+              echo "Dumping mp4 files for debugging:"
+              find . -maxdepth 5 -type f -name "*.mp4" -print | sort | head -n 200 || true
+              exit 1
+            fi
+
+            rm -f chunks.txt
+            for f in "${CHUNKS[@]}"; do
+              printf "file '%s'\n" "$f" >> chunks.txt
+            done
+          fi
+
+          echo "First lines of chunks.txt:"
+          head -n 20 chunks.txt
+
+          # Concat without re-encoding
+          ffmpeg -hide_banner -y -f concat -safe 0 -i chunks.txt -c copy concatenated.mp4
+
+          echo "== Concat result =="
+          ls -lah concatenated.mp4
+
+          # Produce stack.mp4 for downstream steps exactly like before
+          ffmpeg -hide_banner -y -i concatenated.mp4 \
             -c:v libx264 -pix_fmt yuv420p -r "$FPS" -movflags +faststart stack.mp4
+
+          echo "== stack.mp4 =="
+          ls -lah stack.mp4
 
       - name: Build word-by-word ASS subtitles
         shell: bash
