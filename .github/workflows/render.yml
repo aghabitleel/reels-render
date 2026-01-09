@@ -52,10 +52,18 @@ jobs:
           LAYOUT_TYPE=$(jq -r 'try .layout_config.type // "single"' payload.json)
 
           # How far to shift the bottom video DOWN inside the bottom half (pixels)
-          # Increase to push the talking head lower, without cropping head (uses blurred bg fill)
+          # Increase to push the talking head lower, without cropping head (uses bg fill)
           BOTTOM_SHIFT_PX=$(jq -r 'try .layout_config.bottom_shift_px // 240' payload.json)
 
+          # Slowdown factor for bottom video (1.0 = normal, 1.25 = 25% slower)
+          BOTTOM_SPEED=$(jq -r 'try .layout_config.bottom_speed // 1.25' payload.json)
+
           if [ "$RAW_AUDIO_URL" = "null" ]; then RAW_AUDIO_URL=""; fi
+          if [ "$BOTTOM_SPEED" = "null" ] || [ -z "$BOTTOM_SPEED" ]; then BOTTOM_SPEED=1.25; fi
+
+          # Clamp BOTTOM_SPEED to a sane range
+          if awk "BEGIN{exit !($BOTTOM_SPEED < 0.8)}"; then BOTTOM_SPEED=0.8; fi
+          if awk "BEGIN{exit !($BOTTOM_SPEED > 3.0)}"; then BOTTOM_SPEED=3.0; fi
 
           if [ -z "$RAW_AUDIO_URL" ] || ! echo "$RAW_AUDIO_URL" | grep -Eiq '^https?://'; then
             echo "Error: client_payload.audio_url is missing or invalid"
@@ -82,7 +90,9 @@ jobs:
           echo "MAX_CLIPS=$MAX_CLIPS" >> $GITHUB_ENV
           echo "LAYOUT_TYPE=$LAYOUT_TYPE" >> $GITHUB_ENV
           echo "BOTTOM_SHIFT_PX=$BOTTOM_SHIFT_PX" >> $GITHUB_ENV
-          echo "Params: $OUT_NAME ${WIDTH}x${HEIGHT} ${FPS}fps chunk=${CHUNK_SEC}s layout=$LAYOUT_TYPE bottom_shift_px=$BOTTOM_SHIFT_PX"
+          echo "BOTTOM_SPEED=$BOTTOM_SPEED" >> $GITHUB_ENV
+
+          echo "Params: $OUT_NAME ${WIDTH}x${HEIGHT} ${FPS}fps chunk=${CHUNK_SEC}s layout=$LAYOUT_TYPE bottom_shift_px=$BOTTOM_SHIFT_PX bottom_speed=$BOTTOM_SPEED"
 
       - name: Validate video URLs list
         shell: bash
@@ -208,7 +218,7 @@ jobs:
             done
           fi
 
-      - name: Normalize BOTTOM clip (split-screen only), push down without cropping head (no black bars)
+      - name: Normalize BOTTOM clip (split-screen only), push down without cropping head (top half sharp, bottom blur fill, slow down)
         shell: bash
         run: |
           set -euo pipefail
@@ -221,12 +231,16 @@ jobs:
             if [ "$SHIFT" -lt 0 ]; then SHIFT=0; fi
             if [ "$SHIFT" -gt 500 ]; then SHIFT=500; fi
 
-            echo "Normalizing BOTTOM: bottom_half=${BOTTOM_HEIGHT}px, shift_down=${SHIFT}px (blur bg fill)"
+            echo "Normalizing BOTTOM: bottom_half=${BOTTOM_HEIGHT}px, shift_down=${SHIFT}px, speed=${BOTTOM_SPEED} (top sharp, bottom blurred bg fill)"
 
             ffmpeg -y -i "bottom.mp4" \
               -filter_complex "\
-                [0:v]fps=${FPS},setsar=1,split=2[bgsrc][fgsrc]; \
-                [bgsrc]scale=${WIDTH}:${BOTTOM_HEIGHT}:force_original_aspect_ratio=increase,crop=${WIDTH}:${BOTTOM_HEIGHT},gblur=sigma=18[bg]; \
+                [0:v]fps=${FPS},setsar=1,setpts=PTS*${BOTTOM_SPEED},split=2[bgsrc][fgsrc]; \
+                [bgsrc]scale=${WIDTH}:${BOTTOM_HEIGHT}:force_original_aspect_ratio=increase,crop=${WIDTH}:${BOTTOM_HEIGHT}[bgbase]; \
+                [bgbase]split=2[bgA][bgB]; \
+                [bgA]crop=iw:ih/2:0:0[bg_top]; \
+                [bgB]gblur=sigma=18,crop=iw:ih/2:0:ih/2[bg_bot]; \
+                [bg_top][bg_bot]vstack=inputs=2[bg]; \
                 [fgsrc]scale=${WIDTH}:${BOTTOM_HEIGHT}:force_original_aspect_ratio=increase,crop=${WIDTH}:${BOTTOM_HEIGHT}[fg]; \
                 [bg][fg]overlay=x=0:y=${SHIFT}:eval=init:format=auto[v]\
               " \
@@ -382,7 +396,7 @@ jobs:
           ffmpeg -y -f concat -safe 0 -i chunks.txt \
             -c:v libx264 -pix_fmt yuv420p -r "$FPS" -movflags +faststart stack.mp4
 
-      - name: Build TikTok / Reels style ASS transcription (chunked + word highlight), positioned 1/3 up from bottom half
+      - name: Build TikTok / Reels style ASS transcription (chunked + word highlight), centered on screen
         shell: bash
         run: |
           set -euo pipefail
@@ -430,7 +444,7 @@ jobs:
           }
 
           CAPTION_X=$((WIDTH / 2))
-          CAPTION_Y=$(( (HEIGHT / 2) + (HEIGHT / 2) * 2 / 3 ))
+          CAPTION_Y=$((HEIGHT / 2))
 
           : > subs.ass
           printf '%s\n' \
