@@ -51,11 +51,9 @@ jobs:
           MAX_CLIPS=$(jq -r 'try .max_clips // 100' payload.json)
           LAYOUT_TYPE=$(jq -r 'try .layout_config.type // "single"' payload.json)
 
-          # Push bottom video framing down by cropping higher up (no black padding)
-          BOTTOM_PAD_PX=$(jq -r 'try .layout_config.bottom_pad_px // 180' payload.json)
-
-          # Slow bottom video slightly (1.08 = 8% slower). Increase to slow more.
-          BOTTOM_SLOW_FACTOR=$(jq -r 'try .layout_config.bottom_slow_factor // 1.08' payload.json)
+          # How far to shift the bottom video DOWN inside the bottom half (pixels)
+          # Increase to push the talking head lower, without cropping head (uses blurred bg fill)
+          BOTTOM_SHIFT_PX=$(jq -r 'try .layout_config.bottom_shift_px // 240' payload.json)
 
           if [ "$RAW_AUDIO_URL" = "null" ]; then RAW_AUDIO_URL=""; fi
 
@@ -83,9 +81,8 @@ jobs:
           echo "CHUNK_SEC=$CHUNK_SEC" >> $GITHUB_ENV
           echo "MAX_CLIPS=$MAX_CLIPS" >> $GITHUB_ENV
           echo "LAYOUT_TYPE=$LAYOUT_TYPE" >> $GITHUB_ENV
-          echo "BOTTOM_PAD_PX=$BOTTOM_PAD_PX" >> $GITHUB_ENV
-          echo "BOTTOM_SLOW_FACTOR=$BOTTOM_SLOW_FACTOR" >> $GITHUB_ENV
-          echo "Params: $OUT_NAME ${WIDTH}x${HEIGHT} ${FPS}fps chunk=${CHUNK_SEC}s layout=$LAYOUT_TYPE bottom_pad_px=$BOTTOM_PAD_PX bottom_slow_factor=$BOTTOM_SLOW_FACTOR"
+          echo "BOTTOM_SHIFT_PX=$BOTTOM_SHIFT_PX" >> $GITHUB_ENV
+          echo "Params: $OUT_NAME ${WIDTH}x${HEIGHT} ${FPS}fps chunk=${CHUNK_SEC}s layout=$LAYOUT_TYPE bottom_shift_px=$BOTTOM_SHIFT_PX"
 
       - name: Validate video URLs list
         shell: bash
@@ -140,6 +137,7 @@ jobs:
           UA="Mozilla/5.0 (X11; Linux x86_64; GH-Actions)"
 
           if [ "$LAYOUT_TYPE" = "split_screen" ]; then
+            # Download TOP videos (B-roll)
             echo "=== Downloading TOP (B-roll) videos ==="
             i=0
             jq -r '.layout_config.top_videos[]' payload.json | while read -r URL; do
@@ -149,6 +147,7 @@ jobs:
               curl -L --fail --retry 5 --retry-delay 2 -A "$UA" "$URL" -o "top_${i}.mp4" || echo "WARN failed $URL"
             done
 
+            # Download BOTTOM video (talking head)
             BOTTOM_URL=$(jq -r '.layout_config.bottom_video' payload.json)
             echo "Downloading BOTTOM (talking head): $BOTTOM_URL -> bottom.mp4"
             curl -L --fail --retry 5 --retry-delay 2 -A "$UA" "$BOTTOM_URL" -o "bottom.mp4" || {
@@ -162,6 +161,7 @@ jobs:
               echo "Warning: No top videos downloaded, using bottom video only"
             fi
           else
+            # Original single-video mode
             echo "=== Downloading videos (single mode) ==="
             i=0
             jq -r '[.video_urls] | flatten | unique[]' payload.json | while read -r URL; do
@@ -208,29 +208,30 @@ jobs:
             done
           fi
 
-      - name: Normalize BOTTOM clip (split-screen only), push framing down without black bars
+      - name: Normalize BOTTOM clip (split-screen only), push down without cropping head (no black bars)
         shell: bash
         run: |
           set -euo pipefail
 
           if [ "$LAYOUT_TYPE" = "split_screen" ] && [ -f "bottom.mp4" ]; then
             BOTTOM_HEIGHT=$((HEIGHT / 2))
-            PAD="${BOTTOM_PAD_PX}"
+            SHIFT="${BOTTOM_SHIFT_PX}"
 
-            if [ "$PAD" = "null" ] || [ -z "$PAD" ]; then PAD=0; fi
-            if [ "$PAD" -lt 0 ]; then PAD=0; fi
-            if [ "$PAD" -gt 500 ]; then PAD=500; fi
+            if [ "$SHIFT" = "null" ] || [ -z "$SHIFT" ]; then SHIFT=0; fi
+            if [ "$SHIFT" -lt 0 ]; then SHIFT=0; fi
+            if [ "$SHIFT" -gt 500 ]; then SHIFT=500; fi
 
-            # We scale to a slightly taller frame then crop the bottom-half window starting at y=PAD.
-            # This shifts the visible portion downward without introducing a black rectangle.
-            TARGET_H=$((BOTTOM_HEIGHT + PAD))
-            if [ "$TARGET_H" -lt $BOTTOM_HEIGHT ]; then TARGET_H=$BOTTOM_HEIGHT; fi
-
-            echo "Normalizing BOTTOM: bottom_half=${BOTTOM_HEIGHT}px, pad=${PAD}px, temp_scale_height=${TARGET_H}px"
+            echo "Normalizing BOTTOM: bottom_half=${BOTTOM_HEIGHT}px, shift_down=${SHIFT}px (blur bg fill)"
 
             ffmpeg -y -i "bottom.mp4" \
-              -vf "scale=${WIDTH}:${TARGET_H}:force_original_aspect_ratio=increase,crop=${WIDTH}:${TARGET_H},crop=${WIDTH}:${BOTTOM_HEIGHT}:0:${PAD},setsar=1,fps=${FPS}" \
-              -an -c:v libx264 -preset veryfast -crf 18 -pix_fmt yuv420p -g $((FPS*2)) "norm_bottom.mp4"
+              -filter_complex "\
+                [0:v]fps=${FPS},setsar=1,split=2[bgsrc][fgsrc]; \
+                [bgsrc]scale=${WIDTH}:${BOTTOM_HEIGHT}:force_original_aspect_ratio=increase,crop=${WIDTH}:${BOTTOM_HEIGHT},gblur=sigma=18[bg]; \
+                [fgsrc]scale=${WIDTH}:${BOTTOM_HEIGHT}:force_original_aspect_ratio=increase,crop=${WIDTH}:${BOTTOM_HEIGHT}[fg]; \
+                [bg][fg]overlay=x=0:y=${SHIFT}:eval=init:format=auto[v]\
+              " \
+              -map "[v]" -an \
+              -c:v libx264 -preset veryfast -crf 18 -pix_fmt yuv420p -g $((FPS*2)) "norm_bottom.mp4"
           fi
 
       - name: Make fixed-length chunks (split-screen mode)
@@ -262,7 +263,6 @@ jobs:
           CHUNK="$CHUNK_SEC"
           TOP_HEIGHT=$((HEIGHT / 2))
           BOTTOM_HEIGHT=$((HEIGHT / 2))
-          SLOW="${BOTTOM_SLOW_FACTOR}"
 
           NEED=$(awk -v t="$TARGET" -v c="$CHUNK" 'BEGIN{print int(t/c + 0.999999)}')
           if [ "$NEED" -lt 1 ]; then NEED=1; fi
@@ -295,15 +295,15 @@ jobs:
 
             out=$(printf "chunk_%04d.mp4" "$n")
 
-            echo "Chunk $n: TOP[$top_idx start=$top_start] + BOTTOM[loop slow=${SLOW}] -> $out"
+            echo "Chunk $n: TOP[$top_idx start=$top_start] + BOTTOM[loop] -> $out"
 
             ffmpeg -hide_banner -y \
               -ss "$top_start" -i "$top_file" -t "$CHUNK" \
-              -stream_loop -1 -i "norm_bottom.mp4" \
-              -filter_complex "
-                [0:v]scale=${WIDTH}:${TOP_HEIGHT},trim=duration=${CHUNK},setpts=PTS-STARTPTS[top];
-                [1:v]scale=${WIDTH}:${BOTTOM_HEIGHT},setpts=PTS*${SLOW},fps=${FPS},trim=duration=${CHUNK},setpts=PTS-STARTPTS[bottom];
-                [top][bottom]vstack=inputs=2[stacked]
+              -stream_loop -1 -i "norm_bottom.mp4" -t "$CHUNK" \
+              -filter_complex "\
+                [0:v]scale=${WIDTH}:${TOP_HEIGHT}[top]; \
+                [1:v]scale=${WIDTH}:${BOTTOM_HEIGHT}[bottom]; \
+                [top][bottom]vstack=inputs=2[stacked]\
               " \
               -map "[stacked]" \
               -an \
