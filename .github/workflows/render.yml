@@ -52,7 +52,7 @@ jobs:
           LAYOUT_TYPE=$(jq -r 'try .layout_config.type // "single"' payload.json)
 
           # How far to shift the bottom video DOWN inside the bottom half (pixels)
-          # Increase to push the talking head lower, without cropping head (uses bg fill)
+          # This exposes a top strip, we fill it with blurred background to avoid "double face"
           BOTTOM_SHIFT_PX=$(jq -r 'try .layout_config.bottom_shift_px // 240' payload.json)
 
           # Slowdown factor for bottom video (1.0 = normal, 1.25 = 25% slower)
@@ -147,7 +147,6 @@ jobs:
           UA="Mozilla/5.0 (X11; Linux x86_64; GH-Actions)"
 
           if [ "$LAYOUT_TYPE" = "split_screen" ]; then
-            # Download TOP videos (B-roll)
             echo "=== Downloading TOP (B-roll) videos ==="
             i=0
             jq -r '.layout_config.top_videos[]' payload.json | while read -r URL; do
@@ -157,7 +156,6 @@ jobs:
               curl -L --fail --retry 5 --retry-delay 2 -A "$UA" "$URL" -o "top_${i}.mp4" || echo "WARN failed $URL"
             done
 
-            # Download BOTTOM video (talking head)
             BOTTOM_URL=$(jq -r '.layout_config.bottom_video' payload.json)
             echo "Downloading BOTTOM (talking head): $BOTTOM_URL -> bottom.mp4"
             curl -L --fail --retry 5 --retry-delay 2 -A "$UA" "$BOTTOM_URL" -o "bottom.mp4" || {
@@ -171,7 +169,6 @@ jobs:
               echo "Warning: No top videos downloaded, using bottom video only"
             fi
           else
-            # Original single-video mode
             echo "=== Downloading videos (single mode) ==="
             i=0
             jq -r '[.video_urls] | flatten | unique[]' payload.json | while read -r URL; do
@@ -218,7 +215,7 @@ jobs:
             done
           fi
 
-      - name: Normalize BOTTOM clip (split-screen only), push down without cropping head (top half sharp, bottom blur fill, slow down)
+      - name: Normalize BOTTOM clip (split-screen only), push down without "double face" (blur fill in exposed strip) and slow down
         shell: bash
         run: |
           set -euo pipefail
@@ -231,16 +228,12 @@ jobs:
             if [ "$SHIFT" -lt 0 ]; then SHIFT=0; fi
             if [ "$SHIFT" -gt 500 ]; then SHIFT=500; fi
 
-            echo "Normalizing BOTTOM: bottom_half=${BOTTOM_HEIGHT}px, shift_down=${SHIFT}px, speed=${BOTTOM_SPEED} (top sharp, bottom blurred bg fill)"
+            echo "Normalizing BOTTOM: bottom_half=${BOTTOM_HEIGHT}px, shift_down=${SHIFT}px, speed=${BOTTOM_SPEED} (blur fill for exposed strip to avoid duplicate face)"
 
             ffmpeg -y -i "bottom.mp4" \
               -filter_complex "\
                 [0:v]fps=${FPS},setsar=1,setpts=PTS*${BOTTOM_SPEED},split=2[bgsrc][fgsrc]; \
-                [bgsrc]scale=${WIDTH}:${BOTTOM_HEIGHT}:force_original_aspect_ratio=increase,crop=${WIDTH}:${BOTTOM_HEIGHT}[bgbase]; \
-                [bgbase]split=2[bgA][bgB]; \
-                [bgA]crop=iw:ih/2:0:0[bg_top]; \
-                [bgB]gblur=sigma=18,crop=iw:ih/2:0:ih/2[bg_bot]; \
-                [bg_top][bg_bot]vstack=inputs=2[bg]; \
+                [bgsrc]scale=${WIDTH}:${BOTTOM_HEIGHT}:force_original_aspect_ratio=increase,crop=${WIDTH}:${BOTTOM_HEIGHT},gblur=sigma=18[bg]; \
                 [fgsrc]scale=${WIDTH}:${BOTTOM_HEIGHT}:force_original_aspect_ratio=increase,crop=${WIDTH}:${BOTTOM_HEIGHT}[fg]; \
                 [bg][fg]overlay=x=0:y=${SHIFT}:eval=init:format=auto[v]\
               " \
