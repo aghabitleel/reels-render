@@ -51,19 +51,22 @@ jobs:
           MAX_CLIPS=$(jq -r 'try .max_clips // 100' payload.json)
           LAYOUT_TYPE=$(jq -r 'try .layout_config.type // "single"' payload.json)
 
-          # How far to shift the bottom video DOWN inside the bottom half (pixels)
-          # This exposes a top strip, we fill it with blurred background to avoid "double face"
-          BOTTOM_SHIFT_PX=$(jq -r 'try .layout_config.bottom_shift_px // 240' payload.json)
+          # Shift the talking head DOWN inside the bottom half (pixels).
+          # We will NOT blur-fill, we will "fit + pad" so the entire head stays visible.
+          BOTTOM_SHIFT_PX=$(jq -r 'try .layout_config.bottom_shift_px // 0' payload.json)
 
           # Slowdown factor for bottom video (1.0 = normal, 1.25 = 25% slower)
           BOTTOM_SPEED=$(jq -r 'try .layout_config.bottom_speed // 1.25' payload.json)
 
           if [ "$RAW_AUDIO_URL" = "null" ]; then RAW_AUDIO_URL=""; fi
           if [ "$BOTTOM_SPEED" = "null" ] || [ -z "$BOTTOM_SPEED" ]; then BOTTOM_SPEED=1.25; fi
+          if [ "$BOTTOM_SHIFT_PX" = "null" ] || [ -z "$BOTTOM_SHIFT_PX" ]; then BOTTOM_SHIFT_PX=0; fi
 
-          # Clamp BOTTOM_SPEED to a sane range
+          # Clamp
           if awk "BEGIN{exit !($BOTTOM_SPEED < 0.8)}"; then BOTTOM_SPEED=0.8; fi
           if awk "BEGIN{exit !($BOTTOM_SPEED > 3.0)}"; then BOTTOM_SPEED=3.0; fi
+          if [ "$BOTTOM_SHIFT_PX" -lt 0 ]; then BOTTOM_SHIFT_PX=0; fi
+          if [ "$BOTTOM_SHIFT_PX" -gt 600 ]; then BOTTOM_SHIFT_PX=600; fi
 
           if [ -z "$RAW_AUDIO_URL" ] || ! echo "$RAW_AUDIO_URL" | grep -Eiq '^https?://'; then
             echo "Error: client_payload.audio_url is missing or invalid"
@@ -215,7 +218,7 @@ jobs:
             done
           fi
 
-      - name: Normalize BOTTOM clip (split-screen only), push down without "double face" (blur fill in exposed strip) and slow down
+      - name: Normalize BOTTOM clip (split-screen only), fit + pad so the entire head is visible (no blur), and slow down
         shell: bash
         run: |
           set -euo pipefail
@@ -226,18 +229,17 @@ jobs:
 
             if [ "$SHIFT" = "null" ] || [ -z "$SHIFT" ]; then SHIFT=0; fi
             if [ "$SHIFT" -lt 0 ]; then SHIFT=0; fi
-            if [ "$SHIFT" -gt 500 ]; then SHIFT=500; fi
+            if [ "$SHIFT" -gt 600 ]; then SHIFT=600; fi
 
-            echo "Normalizing BOTTOM: bottom_half=${BOTTOM_HEIGHT}px, shift_down=${SHIFT}px, speed=${BOTTOM_SPEED} (blur fill for exposed strip to avoid duplicate face)"
+            echo "Normalizing BOTTOM: bottom_half=${BOTTOM_HEIGHT}px, shift_down=${SHIFT}px, speed=${BOTTOM_SPEED} (fit+pad, no blur, no cropping head)"
 
+            # Key idea:
+            # 1) Scale to FIT inside bottom half (no crop) -> force_original_aspect_ratio=decrease
+            # 2) Pad to exact bottom-half size. We offset the video down by SHIFT but clamp so it never goes out of frame.
+            # This guarantees no duplicated blurry strip and keeps the full head visible.
             ffmpeg -y -i "bottom.mp4" \
-              -filter_complex "\
-                [0:v]fps=${FPS},setsar=1,setpts=PTS*${BOTTOM_SPEED},split=2[bgsrc][fgsrc]; \
-                [bgsrc]scale=${WIDTH}:${BOTTOM_HEIGHT}:force_original_aspect_ratio=increase,crop=${WIDTH}:${BOTTOM_HEIGHT},gblur=sigma=18[bg]; \
-                [fgsrc]scale=${WIDTH}:${BOTTOM_HEIGHT}:force_original_aspect_ratio=increase,crop=${WIDTH}:${BOTTOM_HEIGHT}[fg]; \
-                [bg][fg]overlay=x=0:y=${SHIFT}:eval=init:format=auto[v]\
-              " \
-              -map "[v]" -an \
+              -vf "fps=${FPS},setsar=1,setpts=PTS*${BOTTOM_SPEED},scale=${WIDTH}:${BOTTOM_HEIGHT}:force_original_aspect_ratio=decrease,pad=${WIDTH}:${BOTTOM_HEIGHT}:(ow-iw)/2:min(max(${SHIFT},0),oh-ih)" \
+              -an \
               -c:v libx264 -preset veryfast -crf 18 -pix_fmt yuv420p -g $((FPS*2)) "norm_bottom.mp4"
           fi
 
