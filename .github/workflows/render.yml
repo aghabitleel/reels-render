@@ -130,7 +130,7 @@ jobs:
         run: |
           set -euo pipefail
           UA="Mozilla/5.0 (X11; Linux x86_64; GH-Actions)"
-          
+
           if [ "$LAYOUT_TYPE" = "split_screen" ]; then
             # Download TOP videos (B-roll)
             echo "=== Downloading TOP (B-roll) videos ==="
@@ -141,7 +141,7 @@ jobs:
               echo "Downloading TOP $i: $URL -> top_${i}.mp4"
               curl -L --fail --retry 5 --retry-delay 2 -A "$UA" "$URL" -o "top_${i}.mp4" || echo "WARN failed $URL"
             done
-            
+
             # Download BOTTOM video (talking head)
             BOTTOM_URL=$(jq -r '.layout_config.bottom_video' payload.json)
             echo "Downloading BOTTOM (talking head): $BOTTOM_URL -> bottom.mp4"
@@ -149,7 +149,7 @@ jobs:
               echo "ERROR: Failed to download bottom video"
               exit 1
             }
-            
+
             shopt -s nullglob
             TOP_COUNT=(top_*.mp4)
             if [ ${#TOP_COUNT[@]} -eq 0 ]; then
@@ -165,7 +165,7 @@ jobs:
               echo "Downloading $i: $URL -> in_${i}.mp4"
               curl -L --fail --retry 5 --retry-delay 2 -A "$UA" "$URL" -o "in_${i}.mp4" || echo "WARN failed $URL"
             done
-            
+
             shopt -s nullglob
             COUNT=(in_*.mp4)
             if [ ${#COUNT[@]} -eq 0 ]; then
@@ -173,7 +173,7 @@ jobs:
               exit 1
             fi
           fi
-          
+
           echo "Download complete"
           ls -lh *.mp4 2>/dev/null || true
 
@@ -182,10 +182,10 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s nullglob
-          
+
           if [ "$LAYOUT_TYPE" = "split_screen" ]; then
             TOP_HEIGHT=$((HEIGHT / 2))
-            
+
             for f in top_*.mp4; do
               n=${f#top_}; n=${n%.mp4}
               echo "Normalizing TOP clip $n"
@@ -207,7 +207,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          
+
           if [ "$LAYOUT_TYPE" = "split_screen" ] && [ -f "bottom.mp4" ]; then
             BOTTOM_HEIGHT=$((HEIGHT / 2))
             echo "Normalizing BOTTOM clip (talking head)"
@@ -221,51 +221,52 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s nullglob
-          
+
           if [ "$LAYOUT_TYPE" != "split_screen" ]; then
             exit 0
           fi
-          
+
           echo "=== Creating split-screen chunks ==="
-          
+
           TOP_files=(norm_top_*.mp4)
-          if [ ! -f "norm_bottom.mp4" ]; then
-            echo "Error: norm_bottom.mp4 not found"
+          if [ ${#TOP_files[@]} -eq 0 ]; then
+            echo "Error: No norm_top_*.mp4 found"
+            ls -lah
             exit 1
           fi
-          
+
+          if [ ! -f "norm_bottom.mp4" ]; then
+            echo "Error: norm_bottom.mp4 not found"
+            ls -lah
+            exit 1
+          fi
+
           TARGET="$(cat audio_dur.txt)"
           CHUNK="$CHUNK_SEC"
           TOP_HEIGHT=$((HEIGHT / 2))
           BOTTOM_HEIGHT=$((HEIGHT / 2))
-          
+
           NEED=$(awk -v t="$TARGET" -v c="$CHUNK" 'BEGIN{print int(t/c + 0.999999)}')
           if [ "$NEED" -lt 1 ]; then NEED=1; fi
-          
+
           echo "Creating $NEED chunks of ${CHUNK}s to cover ~${TARGET}s"
-          
-          # Get durations of top files
+
           : > top_durs.txt
           for f in "${TOP_files[@]}"; do
             d=$(ffprobe -v error -show_entries format=duration -of default=nokey=1:noprint_wrappers=1 "$f" || echo "0")
             echo "$f $d" >> top_durs.txt
           done
-          
-          # Get duration of bottom file
-          BOTTOM_DUR=$(ffprobe -v error -show_entries format=duration -of default=nokey=1:noprint_wrappers=1 "norm_bottom.mp4" || echo "0")
-          
+
           rm -f chunks.txt
           TOP_COUNT=${#TOP_files[@]}
-          
-          # Create chunks with top cycling and bottom looping
+
           for ((n=0; n<NEED; n++)); do
-            # Cycle top videos
             top_idx=$(( n % TOP_COUNT ))
             top_file="${TOP_files[$top_idx]}"
-            
+
             top_dur=$(awk -v k="$top_file" '$1==k{print $2}' top_durs.txt)
             top_maxstart=$(awk -v d="$top_dur" -v c="$CHUNK" 'BEGIN{s=d-c; if(s<0)s=0; printf "%.3f", s}')
-            
+
             top_group=$(( n / TOP_COUNT ))
             top_start=$(awk -v g="$top_group" -v c="$CHUNK" -v m="$top_maxstart" 'BEGIN{
               s=g*c;
@@ -273,39 +274,35 @@ jobs:
               if (s>m) s=0;
               printf "%.3f", s
             }')
-            
-            # Bottom just loops (no specific start calculation needed)
-            bottom_start=$(awk -v d="$BOTTOM_DUR" -v t="0" 'BEGIN{printf "%.3f", t}')
-            
+
             out=$(printf "chunk_%04d.mp4" "$n")
-            
+
             echo "Chunk $n: TOP[$top_idx start=$top_start] + BOTTOM[loop] -> $out"
-            
-            # Use filter_complex to stack top and bottom videos
-            ffmpeg -y \
+
+            # IMPORTANT: video-only chunks (no audio mapping here)
+            ffmpeg -hide_banner -y \
               -ss "$top_start" -i "$top_file" -t "$CHUNK" \
-              -ss "$bottom_start" -i "norm_bottom.mp4" -t "$CHUNK" \
+              -stream_loop -1 -i "norm_bottom.mp4" -t "$CHUNK" \
               -filter_complex "
                 [0:v]scale=${WIDTH}:${TOP_HEIGHT}[top];
                 [1:v]scale=${WIDTH}:${BOTTOM_HEIGHT}[bottom];
                 [top][bottom]vstack=inputs=2[stacked]
               " \
-              -map "[stacked]" -map 1:a:0 \
+              -map "[stacked]" \
+              -an \
               -c:v libx264 -preset veryfast -crf 18 -pix_fmt yuv420p -r "$FPS" \
-              -c:a aac -b:a 128k \
               -g $((FPS*2)) "$out"
-            
+
             echo "file '$out'" >> chunks.txt
           done
-          
+
           if [ ! -s chunks.txt ]; then
             echo "Error: No chunks created"
             exit 1
           fi
-          
+
           echo "Created $(grep -c file chunks.txt || echo 0) chunks"
           ls -lah chunk_*.mp4 2>/dev/null || true
-          echo "First lines of chunks.txt:"
           head -n 20 chunks.txt || true
 
       - name: Make fixed-length chunks (single mode)
@@ -313,11 +310,11 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s nullglob
-          
+
           if [ "$LAYOUT_TYPE" = "split_screen" ]; then
             exit 0
           fi
-          
+
           files=(norm_*.mp4)
           if [ ${#files[@]} -eq 0 ]; then
             echo "No normalized clips found"; exit 1
@@ -361,60 +358,12 @@ jobs:
             echo "file '$out'" >> chunks.txt
           done
 
-          if [ ! -s chunks.txt ]; then
-            echo "Error: chunks.txt not created in single mode"
-            exit 1
-          fi
-
-          echo "Created $(grep -c file chunks.txt || echo 0) chunks"
-          ls -lah chunk_*.mp4 2>/dev/null || true
-          echo "First lines of chunks.txt:"
-          head -n 20 chunks.txt || true
-
-      - name: Concat chunks (robust)
+      - name: Concat chunks
         shell: bash
         run: |
           set -euo pipefail
-
-          echo "== Pre-concat debug =="
-          pwd
-          ls -lah
-          ls -lah chunk_*.mp4 2>/dev/null || true
-          ls -lah chunks.txt 2>/dev/null || true
-
-          # If chunks.txt is missing or empty, rebuild it from chunk files
-          if [ ! -s chunks.txt ]; then
-            echo "chunks.txt missing or empty, rebuilding from chunk files..."
-            mapfile -t CHUNKS < <(find . -maxdepth 5 -type f \( -name "chunk_*.mp4" -o -name "chunk-*.mp4" \) | sort)
-
-            if [ "${#CHUNKS[@]}" -eq 0 ]; then
-              echo "ERROR: No chunk mp4 files found, cannot concat."
-              echo "Dumping mp4 files for debugging:"
-              find . -maxdepth 5 -type f -name "*.mp4" -print | sort | head -n 200 || true
-              exit 1
-            fi
-
-            rm -f chunks.txt
-            for f in "${CHUNKS[@]}"; do
-              printf "file '%s'\n" "$f" >> chunks.txt
-            done
-          fi
-
-          echo "First lines of chunks.txt:"
-          head -n 20 chunks.txt
-
-          # Concat without re-encoding
-          ffmpeg -hide_banner -y -f concat -safe 0 -i chunks.txt -c copy concatenated.mp4
-
-          echo "== Concat result =="
-          ls -lah concatenated.mp4
-
-          # Produce stack.mp4 for downstream steps exactly like before
-          ffmpeg -hide_banner -y -i concatenated.mp4 \
+          ffmpeg -y -f concat -safe 0 -i chunks.txt \
             -c:v libx264 -pix_fmt yuv420p -r "$FPS" -movflags +faststart stack.mp4
-
-          echo "== stack.mp4 =="
-          ls -lah stack.mp4
 
       - name: Build word-by-word ASS subtitles
         shell: bash
@@ -428,9 +377,9 @@ jobs:
           fi
 
           TOTAL_SEC="$(cat audio_dur.txt)"
-          
+
           TEXT=$(sed '/^[[:space:]]*$/d' script.txt | tr '\n' ' ' | sed 's/  */ /g')
-          
+
           if [ -z "$TEXT" ]; then
             echo "script.txt has no content, skipping subtitles."
             : > subs.missing
@@ -438,7 +387,7 @@ jobs:
           fi
 
           mapfile -t WORDS < <(echo "$TEXT" | tr ' ' '\n' | sed '/^[[:space:]]*$/d')
-          
+
           if [ "${#WORDS[@]}" -eq 0 ]; then
             echo "No words found, skipping subtitles."
             : > subs.missing
@@ -493,27 +442,27 @@ jobs:
               chunk_end=${#WORDS[@]}
             fi
             chunk_size=$((chunk_end - i))
-            
+
             chunk_chars=0
             for ((j=i; j<chunk_end; j++)); do
               chunk_chars=$((chunk_chars + word_chars[j]))
             done
-            
+
             chunk_duration=$(awk -v t="$TOTAL_SEC" -v c="$chunk_chars" -v sum="$total_chars" -v min="$MIN_DURATION" -v size="$chunk_size" 'BEGIN{
-              d=t*(c/sum); 
-              if (d<(min*size)) d=min*size; 
+              d=t*(c/sum);
+              if (d<(min*size)) d=min*size;
               print d;
             }')
-            
+
             chunk_start_time=$start
             chunk_end_time=$(awk -v a="$start" -v d="$chunk_duration" 'BEGIN{print a+d}')
-            
+
             if [ $chunk_end -ge ${#WORDS[@]} ]; then
               chunk_end_time=$(awk -v t="$TOTAL_SEC" -v p="$pad" 'BEGIN{e=t-p; if(e<0)e=0; print e}')
               ok=$(awk -v a="$start" -v e="$chunk_end_time" 'BEGIN{print (e>a)?1:0}')
               [ "$ok" -ne 1 ] && chunk_end_time=$(awk -v a="$start" 'BEGIN{print a+1.0}')
             fi
-            
+
             full_text=""
             for ((k=i; k<chunk_end; k++)); do
               word="${WORDS[k]}"
@@ -524,54 +473,54 @@ jobs:
                 full_text="${full_text} "
               fi
             done
-            
+
             chunk_s_str=$(fmt_time "$chunk_start_time")
             chunk_e_str=$(fmt_time "$chunk_end_time")
             printf 'Dialogue: 0,%s,%s,Centered,,0,0,0,,{\\an5\\pos(540,1850)\\blur0.5}%s\n' \
               "$chunk_s_str" "$chunk_e_str" "$full_text" >> subs.ass
-            
+
             word_start=$start
             for ((j=i; j<chunk_end; j++)); do
               word_len=${word_chars[j]}
-              
+
               word_duration=$(awk -v total="$chunk_duration" -v c="$word_len" -v sum="$chunk_chars" -v min="$MIN_DURATION" 'BEGIN{
-                d=total*(c/sum); 
-                if (d<min) d=min; 
+                d=total*(c/sum);
+                if (d<min) d=min;
                 print d;
               }')
-              
+
               word_end=$(awk -v a="$word_start" -v d="$word_duration" 'BEGIN{print a+d}')
-              
+
               if [ $j -eq $((chunk_end - 1)) ]; then
                 word_end=$chunk_end_time
               fi
-              
+
               s_str=$(fmt_time "$word_start")
               e_str=$(fmt_time "$word_end")
-              
+
               text=""
               for ((k=i; k<chunk_end; k++)); do
                 word="${WORDS[k]}"
                 esc="${word//'{'/'\{'}"
                 esc="${esc//'}'/'\}'}"
-                
+
                 if [ $k -eq $j ]; then
                   text="${text}{\\c&H00FFFF&}${esc}{\\c&H00FFFFFF&}"
                 else
                   text="${text}{\\alpha&HFF&}${esc}{\\alpha&H00&}"
                 fi
-                
+
                 if [ $k -lt $((chunk_end - 1)) ]; then
                   text="${text} "
                 fi
               done
-              
+
               printf 'Dialogue: 1,%s,%s,Centered,,0,0,0,,{\\an5\\pos(540,1850)\\blur0.5}%s\n' \
                 "$s_str" "$e_str" "$text" >> subs.ass
-              
+
               word_start=$word_end
             done
-            
+
             i=$chunk_end
             start=$chunk_end_time
           done
