@@ -51,9 +51,13 @@ jobs:
           MAX_CLIPS=$(jq -r 'try .max_clips // 100' payload.json)
           LAYOUT_TYPE=$(jq -r 'try .layout_config.type // "single"' payload.json)
 
-          # How far to shift the bottom video DOWN inside the bottom half (pixels)
-          # Increase to push the talking head lower, without cropping head (uses blurred bg fill)
-          BOTTOM_SHIFT_PX=$(jq -r 'try .layout_config.bottom_shift_px // 240' payload.json)
+          # Push the talking-head framing DOWN by effectively "zooming in" a bit then cropping.
+          # This avoids black bars and avoids the blurry rectangle you saw.
+          # Increase to push the head further down.
+          BOTTOM_SHIFT_PX=$(jq -r 'try .layout_config.bottom_shift_px // 260' payload.json)
+
+          # Slow the bottom video slightly (0.90 = 10% slower). Audio remains unchanged.
+          BOTTOM_SPEED=$(jq -r 'try .layout_config.bottom_speed // 0.92' payload.json)
 
           if [ "$RAW_AUDIO_URL" = "null" ]; then RAW_AUDIO_URL=""; fi
 
@@ -82,7 +86,8 @@ jobs:
           echo "MAX_CLIPS=$MAX_CLIPS" >> $GITHUB_ENV
           echo "LAYOUT_TYPE=$LAYOUT_TYPE" >> $GITHUB_ENV
           echo "BOTTOM_SHIFT_PX=$BOTTOM_SHIFT_PX" >> $GITHUB_ENV
-          echo "Params: $OUT_NAME ${WIDTH}x${HEIGHT} ${FPS}fps chunk=${CHUNK_SEC}s layout=$LAYOUT_TYPE bottom_shift_px=$BOTTOM_SHIFT_PX"
+          echo "BOTTOM_SPEED=$BOTTOM_SPEED" >> $GITHUB_ENV
+          echo "Params: $OUT_NAME ${WIDTH}x${HEIGHT} ${FPS}fps chunk=${CHUNK_SEC}s layout=$LAYOUT_TYPE bottom_shift_px=$BOTTOM_SHIFT_PX bottom_speed=$BOTTOM_SPEED"
 
       - name: Validate video URLs list
         shell: bash
@@ -137,7 +142,6 @@ jobs:
           UA="Mozilla/5.0 (X11; Linux x86_64; GH-Actions)"
 
           if [ "$LAYOUT_TYPE" = "split_screen" ]; then
-            # Download TOP videos (B-roll)
             echo "=== Downloading TOP (B-roll) videos ==="
             i=0
             jq -r '.layout_config.top_videos[]' payload.json | while read -r URL; do
@@ -147,7 +151,6 @@ jobs:
               curl -L --fail --retry 5 --retry-delay 2 -A "$UA" "$URL" -o "top_${i}.mp4" || echo "WARN failed $URL"
             done
 
-            # Download BOTTOM video (talking head)
             BOTTOM_URL=$(jq -r '.layout_config.bottom_video' payload.json)
             echo "Downloading BOTTOM (talking head): $BOTTOM_URL -> bottom.mp4"
             curl -L --fail --retry 5 --retry-delay 2 -A "$UA" "$BOTTOM_URL" -o "bottom.mp4" || {
@@ -161,7 +164,6 @@ jobs:
               echo "Warning: No top videos downloaded, using bottom video only"
             fi
           else
-            # Original single-video mode
             echo "=== Downloading videos (single mode) ==="
             i=0
             jq -r '[.video_urls] | flatten | unique[]' payload.json | while read -r URL; do
@@ -194,21 +196,17 @@ jobs:
             for f in top_*.mp4; do
               n=${f#top_}; n=${n%.mp4}
               echo "Normalizing TOP clip $n"
-              ffmpeg -y -i "$f" \
-                -vf "scale=${WIDTH}:${TOP_HEIGHT}:force_original_aspect_ratio=increase,crop=${WIDTH}:${TOP_HEIGHT},setsar=1,fps=${FPS}" \
-                -an -c:v libx264 -preset veryfast -crf 18 -pix_fmt yuv420p -g $((FPS*2)) "norm_top_${n}.mp4"
+              ffmpeg -y -i "$f"                 -vf "scale=${WIDTH}:${TOP_HEIGHT}:force_original_aspect_ratio=increase,crop=${WIDTH}:${TOP_HEIGHT},setsar=1,fps=${FPS}"                 -an -c:v libx264 -preset veryfast -crf 18 -pix_fmt yuv420p -g $((FPS*2)) "norm_top_${n}.mp4"
             done
           else
             for f in in_*.mp4; do
               n=${f#in_}; n=${n%.mp4}
               echo "Normalizing $f"
-              ffmpeg -y -i "$f" \
-                -vf "scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=increase,crop=${WIDTH}:${HEIGHT},setsar=1,fps=${FPS}" \
-                -an -c:v libx264 -preset veryfast -crf 18 -pix_fmt yuv420p -g $((FPS*2)) "norm_${n}.mp4"
+              ffmpeg -y -i "$f"                 -vf "scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=increase,crop=${WIDTH}:${HEIGHT},setsar=1,fps=${FPS}"                 -an -c:v libx264 -preset veryfast -crf 18 -pix_fmt yuv420p -g $((FPS*2)) "norm_${n}.mp4"
             done
           fi
 
-      - name: Normalize BOTTOM clip (split-screen only), push down without cropping head (no black bars)
+      - name: Normalize BOTTOM clip (split-screen only), shift down + slow slightly (no blur box)
         shell: bash
         run: |
           set -euo pipefail
@@ -216,22 +214,22 @@ jobs:
           if [ "$LAYOUT_TYPE" = "split_screen" ] && [ -f "bottom.mp4" ]; then
             BOTTOM_HEIGHT=$((HEIGHT / 2))
             SHIFT="${BOTTOM_SHIFT_PX}"
+            SPEED="${BOTTOM_SPEED}"
 
             if [ "$SHIFT" = "null" ] || [ -z "$SHIFT" ]; then SHIFT=0; fi
             if [ "$SHIFT" -lt 0 ]; then SHIFT=0; fi
-            if [ "$SHIFT" -gt 500 ]; then SHIFT=500; fi
+            if [ "$SHIFT" -gt 520 ]; then SHIFT=520; fi
 
-            echo "Normalizing BOTTOM: bottom_half=${BOTTOM_HEIGHT}px, shift_down=${SHIFT}px (blur bg fill)"
+            if [ "$SPEED" = "null" ] || [ -z "$SPEED" ]; then SPEED="1.0"; fi
 
-            ffmpeg -y -i "bottom.mp4" \
-              -filter_complex "\
-                [0:v]fps=${FPS},setsar=1,split=2[bgsrc][fgsrc]; \
-                [bgsrc]scale=${WIDTH}:${BOTTOM_HEIGHT}:force_original_aspect_ratio=increase,crop=${WIDTH}:${BOTTOM_HEIGHT},gblur=sigma=18[bg]; \
-                [fgsrc]scale=${WIDTH}:${BOTTOM_HEIGHT}:force_original_aspect_ratio=increase,crop=${WIDTH}:${BOTTOM_HEIGHT}[fg]; \
-                [bg][fg]overlay=x=0:y=${SHIFT}:eval=init:format=auto[v]\
-              " \
-              -map "[v]" -an \
-              -c:v libx264 -preset veryfast -crf 18 -pix_fmt yuv420p -g $((FPS*2)) "norm_bottom.mp4"
+            # We "zoom" by scaling to (BOTTOM_HEIGHT + SHIFT) then cropping down to BOTTOM_HEIGHT starting at y=SHIFT.
+            # That moves the framing down without introducing black or blur fills.
+            ZH=$((BOTTOM_HEIGHT + SHIFT))
+            if [ "$ZH" -lt "$BOTTOM_HEIGHT" ]; then ZH="$BOTTOM_HEIGHT"; fi
+
+            echo "Normalizing BOTTOM: bottom_half=${BOTTOM_HEIGHT}px, shift_down=${SHIFT}px, scaled_height=${ZH}px, speed=${SPEED}x"
+
+            ffmpeg -y -i "bottom.mp4"               -vf "fps=${FPS},setpts=PTS/${SPEED},scale=${WIDTH}:${ZH}:force_original_aspect_ratio=increase,crop=${WIDTH}:${BOTTOM_HEIGHT}:0:${SHIFT},setsar=1"               -an -c:v libx264 -preset veryfast -crf 18 -pix_fmt yuv420p -g $((FPS*2)) "norm_bottom.mp4"
           fi
 
       - name: Make fixed-length chunks (split-screen mode)
@@ -297,18 +295,7 @@ jobs:
 
             echo "Chunk $n: TOP[$top_idx start=$top_start] + BOTTOM[loop] -> $out"
 
-            ffmpeg -hide_banner -y \
-              -ss "$top_start" -i "$top_file" -t "$CHUNK" \
-              -stream_loop -1 -i "norm_bottom.mp4" -t "$CHUNK" \
-              -filter_complex "\
-                [0:v]scale=${WIDTH}:${TOP_HEIGHT}[top]; \
-                [1:v]scale=${WIDTH}:${BOTTOM_HEIGHT}[bottom]; \
-                [top][bottom]vstack=inputs=2[stacked]\
-              " \
-              -map "[stacked]" \
-              -an \
-              -c:v libx264 -preset veryfast -crf 18 -pix_fmt yuv420p -r "$FPS" \
-              -g $((FPS*2)) "$out"
+            ffmpeg -hide_banner -y               -ss "$top_start" -i "$top_file" -t "$CHUNK"               -stream_loop -1 -i "norm_bottom.mp4" -t "$CHUNK"               -filter_complex "                [0:v]scale=${WIDTH}:${TOP_HEIGHT}[top];                 [1:v]scale=${WIDTH}:${BOTTOM_HEIGHT}[bottom];                 [top][bottom]vstack=inputs=2[stacked]              "               -map "[stacked]"               -an               -c:v libx264 -preset veryfast -crf 18 -pix_fmt yuv420p -r "$FPS"               -g $((FPS*2)) "$out"
 
             echo "file '$out'" >> chunks.txt
           done
@@ -370,8 +357,7 @@ jobs:
 
             out=$(printf "chunk_%04d.mp4" "$n")
             echo "Cut $f start=$start len=$CHUNK -> $out"
-            ffmpeg -y -ss "$start" -i "$f" -t "$CHUNK" \
-              -an -c:v libx264 -preset veryfast -crf 18 -r "$FPS" -pix_fmt yuv420p -g $((FPS*2)) "$out"
+            ffmpeg -y -ss "$start" -i "$f" -t "$CHUNK"               -an -c:v libx264 -preset veryfast -crf 18 -r "$FPS" -pix_fmt yuv420p -g $((FPS*2)) "$out"
             echo "file '$out'" >> chunks.txt
           done
 
@@ -379,8 +365,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          ffmpeg -y -f concat -safe 0 -i chunks.txt \
-            -c:v libx264 -pix_fmt yuv420p -r "$FPS" -movflags +faststart stack.mp4
+          ffmpeg -y -f concat -safe 0 -i chunks.txt             -c:v libx264 -pix_fmt yuv420p -r "$FPS" -movflags +faststart stack.mp4
 
       - name: Build TikTok / Reels style ASS transcription (chunked + word highlight), positioned 1/3 up from bottom half
         shell: bash
@@ -395,14 +380,16 @@ jobs:
 
           TOTAL_SEC="$(cat audio_dur.txt)"
 
-          TEXT=$(sed '/^[[:space:]]*$/d' script.txt | tr '\n' ' ' | sed 's/  */ /g')
+          TEXT=$(sed '/^[[:space:]]*$/d' script.txt | tr '
+' ' ' | sed 's/  */ /g')
           if [ -z "$TEXT" ]; then
             echo "script.txt has no content, skipping subtitles."
             : > subs.missing
             exit 0
           fi
 
-          mapfile -t WORDS < <(echo "$TEXT" | tr ' ' '\n' | sed '/^[[:space:]]*$/d')
+          mapfile -t WORDS < <(echo "$TEXT" | tr ' ' '
+' | sed '/^[[:space:]]*$/d')
           if [ "${#WORDS[@]}" -eq 0 ]; then
             echo "No words found, skipping subtitles."
             : > subs.missing
@@ -433,20 +420,8 @@ jobs:
           CAPTION_Y=$(( (HEIGHT / 2) + (HEIGHT / 2) * 2 / 3 ))
 
           : > subs.ass
-          printf '%s\n' \
-            '[Script Info]' \
-            'ScriptType: v4.00+' \
-            "PlayResX: ${WIDTH}" \
-            "PlayResY: ${HEIGHT}" \
-            'WrapStyle: 2' \
-            'ScaledBorderAndShadow: yes' \
-            '' \
-            '[V4+ Styles]' \
-            'Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding' \
-            'Style: Reels,DejaVu Sans Bold,54,&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,1,0,0,0,100,100,0,0,1,6,2,5,60,60,20,1' \
-            '' \
-            '[Events]' \
-            'Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text' >> subs.ass
+          printf '%s
+'             '[Script Info]'             'ScriptType: v4.00+'             "PlayResX: ${WIDTH}"             "PlayResY: ${HEIGHT}"             'WrapStyle: 2'             'ScaledBorderAndShadow: yes'             ''             '[V4+ Styles]'             'Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding'             'Style: Reels,DejaVu Sans Bold,54,&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,1,0,0,0,100,100,0,0,1,6,2,5,60,60,20,1'             ''             '[Events]'             'Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text' >> subs.ass
 
           start=0
           MIN_DURATION=0.28
@@ -495,8 +470,8 @@ jobs:
             chunk_s_str=$(fmt_time "$chunk_start_time")
             chunk_e_str=$(fmt_time "$chunk_end_time")
 
-            printf 'Dialogue: 0,%s,%s,Reels,,0,0,0,,{\\an5\\pos(%d,%d)\\blur0.4\\fad(80,80)}%s\n' \
-              "$chunk_s_str" "$chunk_e_str" "$CAPTION_X" "$CAPTION_Y" "$full_text" >> subs.ass
+            printf 'Dialogue: 0,%s,%s,Reels,,0,0,0,,{\an5\pos(%d,%d)\blur0.4\fad(80,80)}%s
+'               "$chunk_s_str" "$chunk_e_str" "$CAPTION_X" "$CAPTION_Y" "$full_text" >> subs.ass
 
             word_start=$start
             for ((j=i; j<chunk_end; j++)); do
@@ -523,9 +498,9 @@ jobs:
                 esc="${esc//'}'/'\}'}"
 
                 if [ $k -eq $j ]; then
-                  text="${text}{\\c&H00FFFF&}${esc}{\\c&H00FFFFFF&}"
+                  text="${text}{\c&H00FFFF&}${esc}{\c&H00FFFFFF&}"
                 else
-                  text="${text}{\\alpha&HFF&}${esc}{\\alpha&H00&}"
+                  text="${text}{\alpha&HFF&}${esc}{\alpha&H00&}"
                 fi
 
                 if [ $k -lt $((chunk_end - 1)) ]; then
@@ -533,8 +508,8 @@ jobs:
                 fi
               done
 
-              printf 'Dialogue: 1,%s,%s,Reels,,0,0,0,,{\\an5\\pos(%d,%d)\\blur0.4\\fad(80,80)}%s\n' \
-                "$s_str" "$e_str" "$CAPTION_X" "$CAPTION_Y" "$text" >> subs.ass
+              printf 'Dialogue: 1,%s,%s,Reels,,0,0,0,,{\an5\pos(%d,%d)\blur0.4\fad(80,80)}%s
+'                 "$s_str" "$e_str" "$CAPTION_X" "$CAPTION_Y" "$text" >> subs.ass
 
               word_start=$word_end
             done
@@ -559,13 +534,7 @@ jobs:
             echo "No subs.ass present, rendering without subtitles."
           fi
 
-          ffmpeg -y -stream_loop -1 -i stack.mp4 -i audio.m4a \
-            "${FILTER_ARGS[@]}" \
-            -map 0:v:0 -map 1:a:0 \
-            -shortest \
-            -c:v libx264 -profile:v high -pix_fmt yuv420p -r "$FPS" \
-            -c:a copy \
-            -movflags +faststart "$OUT_NAME"
+          ffmpeg -y -stream_loop -1 -i stack.mp4 -i audio.m4a             "${FILTER_ARGS[@]}"             -map 0:v:0 -map 1:a:0             -shortest             -c:v libx264 -profile:v high -pix_fmt yuv420p -r "$FPS"             -c:a copy             -movflags +faststart "$OUT_NAME"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
