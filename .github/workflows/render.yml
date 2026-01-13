@@ -227,17 +227,25 @@ jobs:
 
             echo "Normalizing BOTTOM: target=${WIDTH}x${BOTTOM_H}, minimal cover scale (no extra zoom), shift=${SHIFT}, speed=${BOTTOM_SPEED}"
 
-            # This does the minimum zoom needed to eliminate black bars:
-            # - scale to "cover" the target (force_original_aspect_ratio=increase)
-            # - crop to exact target size
-            # We crop vertically centered, then apply SHIFT (positive moves crop down).
-            # Clamp y into [0, ih-BOTTOM_H]
+            # Minimum zoom to eliminate black bars, crop to exact size, vertical shift
             Y_EXPR="min(max((ih-${BOTTOM_H})/2+${SHIFT}\,0)\,ih-${BOTTOM_H})"
 
             ffmpeg -y -i "bottom.mp4" \
               -vf "fps=${FPS},setsar=1,setpts=PTS*${BOTTOM_SPEED},scale=${WIDTH}:${BOTTOM_H}:force_original_aspect_ratio=increase,crop=${WIDTH}:${BOTTOM_H}:(iw-${WIDTH})/2:'${Y_EXPR}'" \
               -an \
               -c:v libx264 -preset veryfast -crf 18 -pix_fmt yuv420p -g $((FPS*2)) "norm_bottom.mp4"
+          fi
+
+      - name: Build full-length bottom timeline (looped once to audio length)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$LAYOUT_TYPE" = "split_screen" ] && [ -f "norm_bottom.mp4" ]; then
+            TARGET="$(cat audio_dur.txt)"
+            echo "Looping bottom to ${TARGET}s"
+            ffmpeg -y -stream_loop -1 -i "norm_bottom.mp4" -t "$TARGET" \
+              -c:v libx264 -preset veryfast -crf 18 -pix_fmt yuv420p -r "$FPS" \
+              -g $((FPS*2)) "bottom_full.mp4"
           fi
 
       - name: Make fixed-length chunks (split-screen mode)
@@ -259,8 +267,8 @@ jobs:
             exit 1
           fi
 
-          if [ ! -f "norm_bottom.mp4" ]; then
-            echo "Error: norm_bottom.mp4 not found"
+          if [ ! -f "bottom_full.mp4" ]; then
+            echo "Error: bottom_full.mp4 not found"
             ls -lah
             exit 1
           fi
@@ -300,16 +308,16 @@ jobs:
             }')
 
             out=$(printf "chunk_%04d.mp4" "$n")
-            echo "Chunk $n: TOP[$top_idx start=$top_start] + BOTTOM[loop] -> $out"
+            bstart=$(awk -v n="$n" -v c="$CHUNK" 'BEGIN{printf "%.3f", n*c}')
+            echo "Chunk $n: TOP[$top_idx start=$top_start] + BOTTOM[start=$bstart] -> $out"
 
             ffmpeg -hide_banner -y \
               -ss "$top_start" -i "$top_file" -t "$CHUNK" \
-              -stream_loop -1 -i "norm_bottom.mp4" -t "$CHUNK" \
+              -ss "$bstart" -i "bottom_full.mp4" -t "$CHUNK" \
               -filter_complex "\
                 [0:v]scale=${WIDTH}:${TOP_H}[top]; \
                 [1:v]scale=${WIDTH}:${BOTTOM_H}[bottom]; \
-                [top][bottom]vstack=inputs=2[stacked]\
-              " \
+                [top][bottom]vstack=inputs=2[stacked]" \
               -map "[stacked]" \
               -an \
               -c:v libx264 -preset veryfast -crf 18 -pix_fmt yuv420p -r "$FPS" \
