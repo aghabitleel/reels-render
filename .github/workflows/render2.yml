@@ -1,0 +1,273 @@
+# .github/workflows/render_reel_v2.yml
+# New workflow, does NOT touch your existing render workflow.
+# Trigger it from n8n using repository_dispatch event_type: "render_reel_v2"
+
+name: Render Reel V2 (TalkingHead then Broll)
+
+on:
+  repository_dispatch:
+    types: [render_reel_v2]
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg jq python3
+
+      - name: Write payload to file
+        run: |
+          cat > payload.json <<'JSON'
+          ${{ toJson(github.event.client_payload) }}
+          JSON
+          echo "Payload saved:"
+          jq '.' payload.json
+
+      - name: Render (talking head then broll)
+        env:
+          PAYLOAD_PATH: payload.json
+        run: |
+          set -euo pipefail
+
+          AUDIO_URL=$(jq -r '.audio_url // ""' "$PAYLOAD_PATH")
+          OUT_NAME=$(jq -r '.out_name // "reel_v2.mp4"' "$PAYLOAD_PATH")
+          WIDTH=$(jq -r '.width // 1080' "$PAYLOAD_PATH")
+          HEIGHT=$(jq -r '.height // 1920' "$PAYLOAD_PATH")
+          FPS=$(jq -r '.fps // 30' "$PAYLOAD_PATH")
+          CHUNK_SEC=$(jq -r '.chunk_sec // 4' "$PAYLOAD_PATH")
+
+          LAYOUT_TYPE=$(jq -r '.layout_config.type // ""' "$PAYLOAD_PATH")
+          TH_URL=$(jq -r '.layout_config.talking_head_url // ""' "$PAYLOAD_PATH")
+          TH_SPEED=$(jq -r '.layout_config.talking_head_speed // 1.0' "$PAYLOAD_PATH")
+
+          # broll list is layout_config.broll_videos (preferred), else fallback to video_urls
+          BROLL_JSON=$(jq -c 'if (.layout_config.broll_videos | type) == "array" then .layout_config.broll_videos else (.video_urls // []) end' "$PAYLOAD_PATH")
+          BROLL_COUNT=$(echo "$BROLL_JSON" | jq 'length')
+
+          if [ -z "$AUDIO_URL" ] || [ "$AUDIO_URL" = "null" ]; then
+            echo "Error: audio_url missing"
+            exit 1
+          fi
+          if [ "$LAYOUT_TYPE" != "talking_head_then_broll" ]; then
+            echo "Error: layout_config.type must be talking_head_then_broll for this workflow"
+            echo "Got: $LAYOUT_TYPE"
+            exit 1
+          fi
+          if [ -z "$TH_URL" ] || [ "$TH_URL" = "null" ]; then
+            echo "Error: layout_config.talking_head_url missing"
+            exit 1
+          fi
+          if [ "$BROLL_COUNT" -lt 1 ]; then
+            echo "Error: Need at least 1 broll video url"
+            exit 1
+          fi
+
+          mkdir -p work out
+
+          echo "Downloading audio..."
+          curl -L --retry 5 --retry-delay 2 -o work/audio.wav "$AUDIO_URL"
+
+          echo "Downloading talking head..."
+          curl -L --retry 5 --retry-delay 2 -o work/talking_head.mp4 "$TH_URL"
+
+          echo "Downloading broll urls..."
+          echo "$BROLL_JSON" | jq -r '.[]' > work/broll_urls.txt
+
+          # Download broll clips
+          i=0
+          while IFS= read -r url; do
+            i=$((i+1))
+            echo "Downloading broll $i: $url"
+            curl -L --retry 5 --retry-delay 2 -o "work/broll_${i}.mp4" "$url" || true
+            # If download failed, remove empty file so we skip it
+            if [ ! -s "work/broll_${i}.mp4" ]; then
+              rm -f "work/broll_${i}.mp4"
+            fi
+          done < work/broll_urls.txt
+
+          # Fail if no broll actually downloaded
+          BROLL_FILES_COUNT=$(ls -1 work/broll_*.mp4 2>/dev/null | wc -l | tr -d ' ')
+          if [ "$BROLL_FILES_COUNT" -lt 1 ]; then
+            echo "Error: could not download any broll clips"
+            exit 1
+          fi
+
+          # Audio duration
+          AUDIO_DUR=$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 work/audio.wav)
+          AUDIO_DUR=${AUDIO_DUR%.*}
+          if [ -z "$AUDIO_DUR" ] || [ "$AUDIO_DUR" -lt 1 ]; then
+            AUDIO_DUR=1
+          fi
+          echo "Audio duration: ${AUDIO_DUR}s"
+
+          # Normalize talking head to full 9:16, mute it, apply speed if needed
+          echo "Normalizing talking head..."
+          # If speed != 1.0, adjust PTS
+          # setpts=PTS/<speed> makes it play faster
+          ffmpeg -y -i work/talking_head.mp4 \
+            -vf "scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=increase,crop=${WIDTH}:${HEIGHT},setsar=1,fps=${FPS},setpts=PTS/${TH_SPEED}" \
+            -an -c:v libx264 -preset veryfast -crf 21 work/th_norm.mp4
+
+          TH_DUR_RAW=$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 work/th_norm.mp4)
+          TH_DUR_RAW=${TH_DUR_RAW%.*}
+          if [ -z "$TH_DUR_RAW" ] || [ "$TH_DUR_RAW" -lt 1 ]; then
+            TH_DUR_RAW=1
+          fi
+
+          # Talking head should not exceed audio duration
+          if [ "$TH_DUR_RAW" -gt "$AUDIO_DUR" ]; then
+            TH_DUR=$AUDIO_DUR
+          else
+            TH_DUR=$TH_DUR_RAW
+          fi
+
+          REMAIN=$((AUDIO_DUR - TH_DUR))
+          if [ "$REMAIN" -lt 0 ]; then
+            REMAIN=0
+          fi
+
+          echo "Talking head segment: ${TH_DUR}s"
+          echo "Broll segment target: ${REMAIN}s"
+
+          # Trim talking head segment
+          ffmpeg -y -i work/th_norm.mp4 -t "$TH_DUR" -an -c:v libx264 -preset veryfast -crf 21 work/seg_th.mp4
+
+          # Build broll sequence of REMAIN seconds using CHUNK_SEC chunks
+          if [ "$REMAIN" -gt 0 ]; then
+            echo "Preparing broll chunks..."
+            rm -f work/concat_broll.txt
+            touch work/concat_broll.txt
+
+            # Make enough chunks, cycling broll files if needed
+            CHUNKS=$(( (REMAIN + CHUNK_SEC - 1) / CHUNK_SEC ))
+            if [ "$CHUNKS" -lt 1 ]; then
+              CHUNKS=1
+            fi
+
+            mapfile -t BFILES < <(ls -1 work/broll_*.mp4 | sort)
+            BCOUNT=${#BFILES[@]}
+
+            for n in $(seq 1 "$CHUNKS"); do
+              idx=$(( (n - 1) % BCOUNT ))
+              src="${BFILES[$idx]}"
+
+              # Normalize + take first CHUNK_SEC seconds
+              ffmpeg -y -i "$src" \
+                -t "$CHUNK_SEC" \
+                -vf "scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=increase,crop=${WIDTH}:${HEIGHT},setsar=1,fps=${FPS}" \
+                -an -c:v libx264 -preset veryfast -crf 21 "work/bchunk_${n}.mp4"
+
+              echo "file bchunk_${n}.mp4" >> work/concat_broll.txt
+            done
+
+            echo "Concatenating broll..."
+            ffmpeg -y -f concat -safe 0 -i work/concat_broll.txt -c copy work/broll_seq_raw.mp4
+
+            # Trim broll exactly to remaining time
+            ffmpeg -y -i work/broll_seq_raw.mp4 -t "$REMAIN" -an -c:v libx264 -preset veryfast -crf 21 work/seg_broll.mp4
+
+            echo "Concatenating talking head + broll..."
+            cat > work/concat_all.txt <<'TXT'
+file seg_th.mp4
+file seg_broll.mp4
+TXT
+            ffmpeg -y -f concat -safe 0 -i work/concat_all.txt -c copy work/stack.mp4
+          else
+            cp work/seg_th.mp4 work/stack.mp4
+          fi
+
+          # Generate very lightweight captions from script_lines by evenly distributing across audio duration
+          echo "Generating captions..."
+          python3 - <<'PY'
+import json, math, os
+
+payload = json.load(open("payload.json","r",encoding="utf-8"))
+lines = payload.get("script_lines") or []
+audio_dur = float(payload.get("audioDurationSec") or payload.get("audio_duration") or 0) or None
+
+# If duration not provided in payload, read from ffprobe output that we already computed
+if audio_dur is None:
+  audio_dur = 1.0
+
+# Hard safety
+if audio_dur < 1:
+  audio_dur = 1.0
+
+# Keep captions short
+lines = [str(x).strip() for x in lines if str(x).strip()]
+if not lines:
+  # Create a blank ASS to avoid failures
+  lines = [""]
+
+# ASS helpers
+def ass_time(t):
+  # h:mm:ss.cs
+  h = int(t // 3600)
+  t -= h*3600
+  m = int(t // 60)
+  t -= m*60
+  s = int(t)
+  cs = int(round((t - s) * 100))
+  return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
+
+W = int(payload.get("width") or 1080)
+H = int(payload.get("height") or 1920)
+
+# Lower third position, bottom-center anchor (an2)
+x = W // 2
+y = int(H * 0.80)
+
+# Split time evenly
+n = len(lines)
+slot = audio_dur / n
+
+ass = []
+ass.append("[Script Info]")
+ass.append("ScriptType: v4.00+")
+ass.append("PlayResX: %d" % W)
+ass.append("PlayResY: %d" % H)
+ass.append("")
+ass.append("[V4+ Styles]")
+ass.append("Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding")
+ass.append("Style: Default,Arial,44,&H00FFFFFF,&H000000FF,&H00111111,&H80000000,0,0,0,0,100,100,0,0,3,3,0,2,70,70,50,1")
+ass.append("")
+ass.append("[Events]")
+ass.append("Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text")
+
+# Add simple fade, and force position
+for i, text in enumerate(lines):
+  start = i * slot
+  end = min(audio_dur, (i+1) * slot)
+  if end <= start:
+    end = start + 0.4
+  # Escape ASS special chars
+  text = text.replace("\\","\\\\").replace("{","\\{").replace("}","\\}")
+  override = f"{{\\an2\\pos({x},{y})\\fad(80,80)}}"
+  ass.append(f"Dialogue: 0,{ass_time(start)},{ass_time(end)},Default,,0,0,0,,{override}{text}")
+
+open("work/captions.ass","w",encoding="utf-8").write("\n".join(ass))
+print("Wrote work/captions.ass with", len(lines), "lines")
+PY
+
+          echo "Burning captions and muxing audio..."
+          ffmpeg -y -i work/stack.mp4 -i work/audio.wav \
+            -vf "ass=work/captions.ass" \
+            -c:v libx264 -preset veryfast -crf 21 \
+            -c:a aac -b:a 128k -shortest "out/${OUT_NAME}"
+
+          echo "Done. Output:"
+          ls -lh out
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: reel
+          path: out/*.mp4
+          if-no-files-found: error
