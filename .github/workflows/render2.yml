@@ -1,7 +1,3 @@
-# .github/workflows/render_reel_v2.yml
-# New workflow, does NOT touch your existing render workflow.
-# Trigger it from n8n using repository_dispatch event_type: "render_reel_v2"
-
 name: Render Reel V2 (TalkingHead then Broll)
 
 on:
